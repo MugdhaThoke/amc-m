@@ -44,6 +44,7 @@ class AuthUserRecord:
         "email",
         "avatar_initials",
         "status",
+        "tenant_id",
     )
 
     def __init__(
@@ -57,6 +58,7 @@ class AuthUserRecord:
         email: str = "",
         avatar_initials: str = "",
         status: str = "Active",
+        tenant_id: Optional[str] = None,
     ) -> None:
         self.username = username
         self.password_hash = password_hash
@@ -66,6 +68,7 @@ class AuthUserRecord:
         self.email = email
         self.avatar_initials = avatar_initials or "".join(w[0] for w in display_name.split()[:2]).upper()
         self.status = status
+        self.tenant_id = tenant_id
 
 
 class UserRepository(Protocol):
@@ -158,6 +161,7 @@ class JSONUserRepository:
                     email=entry.get("email", ""),
                     avatar_initials=entry.get("avatar_initials", ""),
                     status=entry.get("status", "Active"),
+                    tenant_id=entry.get("tenant_id"),
                 )
             except KeyError as exc:
                 logger.warning("Skipping malformed user record in %s: missing %s", self._path, exc)

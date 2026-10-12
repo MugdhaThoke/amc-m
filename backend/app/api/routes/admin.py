@@ -16,8 +16,10 @@ import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile, status
 from pydantic import BaseModel, EmailStr, Field
+
+from app.api.deps import OptionalCurrentUser
 logger = logging.getLogger(__name__)
 
 
@@ -38,12 +40,11 @@ def _get_regulatory_lifecycle_enricher() -> Any:
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-# Find users config file path (supports both root and streamlit_app/config)
+# Standalone users configuration file paths
 CONFIG_PATHS = [
-    Path("streamlit_app/config/users_rbac.json"),
     Path("config/users_rbac.json"),
-    Path(__file__).parent.parent.parent.parent.parent / "streamlit_app" / "config" / "users_rbac.json",
-    Path(__file__).parent.parent.parent.parent.parent / "config" / "users_rbac.json",
+    Path("backend/config/users_rbac.json"),
+    Path(__file__).parent.parent.parent.parent / "config" / "users_rbac.json",
 ]
 
 PROTECTED_SYSTEM_USERS = {
@@ -158,6 +159,7 @@ class UserProfileSchema(BaseModel):
     department: str = Field(default="")
     email: str = Field(default="")
     status: str = Field(default="Active")
+    password: Optional[str] = Field(default=None)
 
 
 @router.get("/users")
@@ -169,7 +171,7 @@ async def list_users() -> Dict[str, Any]:
 
 @router.post("/users")
 async def create_or_update_user(payload: UserProfileSchema) -> Dict[str, Any]:
-    """Create or update an AMC user profile."""
+    """Create or update an AMC user profile and synchronize with the auth store."""
     users = _load_users()
     username = payload.username.strip()
     full_name = payload.full_name.strip()
@@ -200,13 +202,139 @@ async def create_or_update_user(payload: UserProfileSchema) -> Dict[str, Any]:
         users.append(new_user)
 
     _save_users(users)
-    return {"user": new_user, "updated": updated, "message": f"Saved profile for {username} ({payload.role} - {new_user['department']}). Refresh page to apply in active session."}
+
+    # Determine password to assign or keep
+    assigned_password = None
+    if payload.password and payload.password.strip():
+        assigned_password = payload.password.strip()
+    elif not updated:
+        # Default temporary password for newly created accounts
+        assigned_password = "Welcome@2026"
+
+    # Synchronize to database auth_users table for login capability
+    try:
+        from app.core.database import SessionLocal
+        from app.schemas.auth_users_table import AuthUser
+        from app.auth.security import hash_password
+
+        with SessionLocal() as db:
+            clean_username = username.lower()
+            db_user = db.query(AuthUser).filter(
+                (AuthUser.username.ilike(clean_username)) |
+                (AuthUser.username.ilike(clean_username.replace("_", "."))) |
+                (AuthUser.username.ilike(clean_username.replace(".", "_")))
+            ).first()
+
+            avatar_initials = "".join(w[0] for w in full_name.split()[:2]).upper() or "U"
+
+            if db_user:
+                db_user.display_name = full_name
+                db_user.role = payload.role
+                db_user.department = payload.department or "General"
+                db_user.email = payload.email or f"{username}@amc.com"
+                db_user.status = payload.status or "Active"
+                db_user.avatar_initials = avatar_initials
+                if assigned_password:
+                    db_user.password_hash = hash_password(assigned_password)
+                db.commit()
+            else:
+                pwd_to_use = assigned_password or "Welcome@2026"
+                assigned_password = pwd_to_use
+                new_db_user = AuthUser(
+                    username=username,
+                    password_hash=hash_password(pwd_to_use),
+                    display_name=full_name,
+                    role=payload.role,
+                    department=payload.department or "General",
+                    email=payload.email or f"{username}@amc.com",
+                    avatar_initials=avatar_initials,
+                    status=payload.status or "Active",
+                )
+                db.add(new_db_user)
+                db.commit()
+    except Exception as db_exc:
+        logger.warning("Could not sync user '%s' to auth_users table: %s", username, db_exc)
+
+    # Synchronize to users.json for fallback consistency
+    try:
+        from app.auth.repository import DEFAULT_USERS_PATH
+        from app.auth.security import hash_password
+
+        if DEFAULT_USERS_PATH.exists():
+            with open(DEFAULT_USERS_PATH, "r", encoding="utf-8") as f:
+                jdata = json.load(f)
+            jusers = jdata.get("users", [])
+            j_found = False
+            for ju in jusers:
+                ju_name = ju.get("username", "").lower()
+                if ju_name in (username.lower(), username.lower().replace("_", "."), username.lower().replace(".", "_")):
+                    ju["display_name"] = full_name
+                    ju["role"] = payload.role
+                    ju["department"] = payload.department or "General"
+                    ju["email"] = payload.email or f"{username}@amc.com"
+                    ju["status"] = payload.status or "Active"
+                    if assigned_password:
+                        ju["password_hash"] = hash_password(assigned_password)
+                    j_found = True
+                    break
+            if not j_found and assigned_password:
+                avatar_initials = "".join(w[0] for w in full_name.split()[:2]).upper() or "U"
+                jusers.append({
+                    "username": username,
+                    "password_hash": hash_password(assigned_password),
+                    "display_name": full_name,
+                    "role": payload.role,
+                    "department": payload.department or "General",
+                    "email": payload.email or f"{username}@amc.com",
+                    "avatar_initials": avatar_initials,
+                    "status": payload.status or "Active",
+                })
+            jdata["users"] = jusers
+            with open(DEFAULT_USERS_PATH, "w", encoding="utf-8") as f:
+                json.dump(jdata, f, indent=2, ensure_ascii=False)
+    except Exception as j_exc:
+        logger.warning("Could not sync user '%s' to users.json: %s", username, j_exc)
+
+    msg = f"Saved profile for {username} ({payload.role} - {new_user['department']})."
+    if assigned_password:
+        msg += f" Login password: '{assigned_password}'."
+
+    return {
+        "user": new_user,
+        "updated": updated,
+        "assigned_password": assigned_password,
+        "message": msg,
+    }
+
+
+def _normalize_username(uname: str | None) -> str:
+    if not uname:
+        return ""
+    return uname.strip().lower().replace(".", "_")
 
 
 @router.delete("/users/{username}")
-async def delete_user(username: str) -> Dict[str, Any]:
-    """Delete a user profile. System users are protected."""
+async def delete_user(
+    username: str,
+    current_user: OptionalCurrentUser = None,
+    x_user_id: Optional[str] = Header(None, alias="X-User-ID"),
+) -> Dict[str, Any]:
+    """Delete a user profile. System users and self-deletion are protected."""
     clean_username = username.strip()
+
+    # Determine caller identity from authenticated session or header
+    caller = ""
+    if current_user and current_user.username:
+        caller = current_user.username
+    elif x_user_id:
+        caller = x_user_id
+
+    # Enforce self-deletion prevention
+    if caller and _normalize_username(caller) == _normalize_username(clean_username):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Administrators cannot delete their own account.",
+        )
 
     if clean_username in PROTECTED_SYSTEM_USERS:
         raise HTTPException(
@@ -218,7 +346,28 @@ async def delete_user(username: str) -> Dict[str, Any]:
     initial_count = len(users)
     users = [u for u in users if u.get("username") != clean_username]
 
-    if len(users) == initial_count:
+    # Also clean up database auth_users record if database auth is enabled
+    db_deleted = False
+    try:
+        from app.config import get_settings
+        settings = get_settings()
+        if settings.auth_use_database:
+            from app.core.database import SessionLocal
+            from app.schemas.auth_users_table import AuthUser
+            with SessionLocal() as db:
+                db_user = db.query(AuthUser).filter(
+                    (AuthUser.username.ilike(clean_username)) |
+                    (AuthUser.username.ilike(clean_username.replace("_", "."))) |
+                    (AuthUser.username.ilike(clean_username.replace(".", "_")))
+                ).first()
+                if db_user:
+                    db.delete(db_user)
+                    db.commit()
+                    db_deleted = True
+    except Exception as e:
+        logger.warning("Error deleting user %s from database: %s", clean_username, e)
+
+    if len(users) == initial_count and not db_deleted:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User {clean_username} not found.",
@@ -312,9 +461,8 @@ async def get_rbac_matrix() -> Dict[str, Any]:
 
 AUDIT_LOG_PATHS = [
     Path("logs/query_execution_audit.jsonl"),
-    Path("streamlit_app/logs/query_execution_audit.jsonl"),
-    Path(__file__).parent.parent.parent.parent.parent / "logs" / "query_execution_audit.jsonl",
-    Path(__file__).parent.parent.parent.parent.parent / "streamlit_app" / "logs" / "query_execution_audit.jsonl",
+    Path("backend/logs/query_execution_audit.jsonl"),
+    Path(__file__).parent.parent.parent.parent / "logs" / "query_execution_audit.jsonl",
 ]
 
 
@@ -771,13 +919,7 @@ async def clear_intent_cache_endpoint() -> Dict[str, Any]:
     except Exception as exc:
         pass
 
-    # 4. Clear Streamlit intent_cache if present
-    try:
-        from streamlit_app import intent_cache as st_cache
-        st_cache.clear_cache()
-        cleared_layers.append("streamlit_intent_cache")
-    except Exception:
-        pass
+
 
     # 5. Clear Feedback Intent Matcher pending notice cache
     try:

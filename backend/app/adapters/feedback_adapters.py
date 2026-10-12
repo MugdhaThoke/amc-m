@@ -298,12 +298,17 @@ class AMCDatabaseAdapter(AbstractDatabaseAdapter):
 
 
 class AMCEvidenceAdapter(AbstractEvidenceAdapter):
-    """Concrete EvidenceAdapter reading frozen D0-D3 context from QueryEvidence."""
+    """Concrete EvidenceAdapter reading frozen D0-D3 context from QueryEvidence with user scoping."""
 
     def __init__(self, session_factory: sessionmaker = SessionLocal) -> None:
         self._session_factory = session_factory
 
-    def get_evidence_snapshot(self, response_id: str) -> dm.EvidenceSnapshot:
+    def get_evidence_snapshot(
+        self,
+        response_id: str,
+        requesting_user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> dm.EvidenceSnapshot:
         with self._session_factory() as session:
             row = (
                 session.query(QueryEvidence)
@@ -311,6 +316,22 @@ class AMCEvidenceAdapter(AbstractEvidenceAdapter):
                 .first()
             )
             if row is None:
+                raise KeyError(f"No query_evidence row found for response_id={response_id}")
+
+            # SECURITY: Verify ownership if requesting_user_id is provided
+            if requesting_user_id and row.user_id != requesting_user_id:
+                logger.warning(
+                    "User %s attempted to access evidence owned by %s (response_id=%s)",
+                    requesting_user_id, row.user_id, response_id
+                )
+                raise KeyError(f"No query_evidence row found for response_id={response_id}")
+
+            # SECURITY: Verify tenant boundary if tenant_id is provided
+            if tenant_id and row.tenant_id != tenant_id:
+                logger.warning(
+                    "Tenant %s attempted to access evidence in tenant %s (response_id=%s)",
+                    tenant_id, row.tenant_id, response_id
+                )
                 raise KeyError(f"No query_evidence row found for response_id={response_id}")
 
             return dm.EvidenceSnapshot(
@@ -322,28 +343,36 @@ class AMCEvidenceAdapter(AbstractEvidenceAdapter):
             )
 
     def get_followup_activity(
-        self, session_id: str, response_id: str, window_minutes: int = 30
+        self,
+        session_id: str,
+        response_id: str,
+        window_minutes: int = 30,
+        requesting_user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> list[dm.FollowUpQuery]:
         with self._session_factory() as session:
-            anchor = (
-                session.query(QueryEvidence)
-                .filter(QueryEvidence.response_id == response_id)
-                .first()
-            )
+            anchor_query = session.query(QueryEvidence).filter(QueryEvidence.response_id == response_id)
+            if requesting_user_id:
+                anchor_query = anchor_query.filter(QueryEvidence.user_id == requesting_user_id)
+            if tenant_id:
+                anchor_query = anchor_query.filter(QueryEvidence.tenant_id == tenant_id)
+            anchor = anchor_query.first()
             if not anchor:
                 return []
 
             anchor_dt = _parse_dt(anchor.created_at)
             cutoff_dt = anchor_dt + timedelta(minutes=window_minutes)
 
-            subsequent = (
-                session.query(QueryEvidence)
-                .filter(
-                    QueryEvidence.session_id == session_id,
-                    QueryEvidence.response_id != response_id,
-                )
-                .all()
+            sub_query = session.query(QueryEvidence).filter(
+                QueryEvidence.session_id == session_id,
+                QueryEvidence.response_id != response_id,
             )
+            if requesting_user_id:
+                sub_query = sub_query.filter(QueryEvidence.user_id == requesting_user_id)
+            if tenant_id:
+                sub_query = sub_query.filter(QueryEvidence.tenant_id == tenant_id)
+
+            subsequent = sub_query.all()
 
             followups = []
             for qe in subsequent:
@@ -358,11 +387,16 @@ class AMCEvidenceAdapter(AbstractEvidenceAdapter):
                     )
             return followups
 
-    def validate_response_exists(self, response_id: str) -> bool:
+    def validate_response_exists(
+        self,
+        response_id: str,
+        requesting_user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> bool:
         with self._session_factory() as session:
-            count = (
-                session.query(QueryEvidence)
-                .filter(QueryEvidence.response_id == response_id)
-                .count()
-            )
-            return count > 0
+            query = session.query(QueryEvidence).filter(QueryEvidence.response_id == response_id)
+            if requesting_user_id:
+                query = query.filter(QueryEvidence.user_id == requesting_user_id)
+            if tenant_id:
+                query = query.filter(QueryEvidence.tenant_id == tenant_id)
+            return query.count() > 0

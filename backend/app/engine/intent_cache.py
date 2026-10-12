@@ -94,6 +94,8 @@ class CacheEntry:
     graph_edges: List[Dict[str, Any]] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     date_entities: set[str] = field(default_factory=set)
+    user_id: Optional[str] = None
+    tenant_id: Optional[str] = None
 
     @property
     def graph_node_count(self) -> int:
@@ -111,8 +113,24 @@ class IntentAwareCache:
         self._misses = 0
         self._load_from_disk()
 
+    def _make_fingerprint_key(
+        self,
+        query_text: str,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> str:
+        if user_id:
+            from app.core.cache_utils import generate_cache_key
+            return generate_cache_key(
+                namespace="intent",
+                key_components={"query": query_text.lower().strip()[:200]},
+                user_id=user_id,
+                tenant_id=tenant_id,
+            )
+        return hashlib.md5(query_text.lower().strip().encode()).hexdigest()
+
     def _update_fingerprint(self, entry: CacheEntry) -> None:
-        fp = hashlib.md5(entry.query_text.lower().strip().encode()).hexdigest()
+        fp = self._make_fingerprint_key(entry.query_text, user_id=entry.user_id, tenant_id=entry.tenant_id)
         self._fingerprint_index[fp] = entry
 
     def _persist_to_disk(self) -> None:
@@ -137,7 +155,9 @@ class IntentAwareCache:
                         "graph_nodes": e.graph_nodes,
                         "graph_edges": e.graph_edges,
                         "created_at": e.created_at,
-                        "date_entities": list(e.date_entities)
+                        "date_entities": list(e.date_entities),
+                        "user_id": e.user_id,
+                        "tenant_id": e.tenant_id,
                     }
                     for e in entries
                 ]
@@ -183,7 +203,9 @@ class IntentAwareCache:
                         graph_nodes=item.get("graph_nodes", []),
                         graph_edges=item.get("graph_edges", []),
                         created_at=item.get("created_at", time.time()),
-                        date_entities=set(item.get("date_entities", []))
+                        date_entities=set(item.get("date_entities", [])),
+                        user_id=item.get("user_id"),
+                        tenant_id=item.get("tenant_id"),
                     )
                     self._entries_by_domain[domain].append(entry)
                     self._update_fingerprint(entry)
@@ -202,12 +224,18 @@ class IntentAwareCache:
         self,
         query_text: str,
         query_type: str = "v2_dual_regime_taxonomy",
-        domain_intent: Optional[str] = None
+        domain_intent: Optional[str] = None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Optional[CacheEntry]:
         """Stage 1: O(1) exact text fingerprint probe — avoids embedding computation entirely."""
-        fp = hashlib.md5(query_text.lower().strip().encode()).hexdigest()
+        fp = self._make_fingerprint_key(query_text, user_id=user_id, tenant_id=tenant_id)
         entry = self._fingerprint_index.get(fp)
         if not entry:
+            return None
+        if user_id and entry.user_id != user_id:
+            return None
+        if tenant_id and entry.tenant_id != tenant_id:
             return None
         if entry.query_type != query_type:
             return None
@@ -231,6 +259,8 @@ class IntentAwareCache:
         query_type: str,
         domain_intent: str,
         query_text: str,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Optional[CacheEntry]:
 
         domain_entries = self._entries_by_domain.get(domain_intent, [])
@@ -253,6 +283,10 @@ class IntentAwareCache:
         query_dates = _extract_date_entities(query_text)
 
         for entry in domain_entries:
+            if user_id and entry.user_id != user_id:
+                continue
+            if tenant_id and entry.tenant_id != tenant_id:
+                continue
             if entry.query_type != query_type:
                 continue
 
@@ -295,6 +329,8 @@ class IntentAwareCache:
         output_tokens_cold: int = 0,
         graph_nodes: List[str] = None,
         graph_edges: List[Dict[str, Any]] = None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> None:
         date_ents = _extract_date_entities(query_text)
         norm_vec = query_vec / (np.linalg.norm(query_vec) + 1e-9)
@@ -313,6 +349,8 @@ class IntentAwareCache:
             graph_nodes=graph_nodes or [],
             graph_edges=graph_edges or [],
             date_entities=date_ents,
+            user_id=user_id,
+            tenant_id=tenant_id,
         )
 
         if domain_intent not in self._entries_by_domain:
@@ -320,6 +358,32 @@ class IntentAwareCache:
         self._entries_by_domain[domain_intent].append(entry)
         self._update_fingerprint(entry)
         self._persist_to_disk()
+
+    def invalidate_user(self, user_id: str, tenant_id: Optional[str] = None) -> int:
+        """Invalidate all cache entries for a specific user across domains and fingerprint index."""
+        if not user_id:
+            return 0
+        removed_count = 0
+        for domain, entries in self._entries_by_domain.items():
+            survivors = []
+            for e in entries:
+                match = (e.user_id == user_id)
+                if match and tenant_id:
+                    match = (e.tenant_id == tenant_id)
+                if match:
+                    removed_count += 1
+                else:
+                    survivors.append(e)
+            self._entries_by_domain[domain] = survivors
+
+        # Rebuild fingerprint index
+        self._fingerprint_index = {
+            self._make_fingerprint_key(e.query_text, user_id=e.user_id, tenant_id=e.tenant_id): e
+            for entries in self._entries_by_domain.values()
+            for e in entries
+        }
+        self._persist_to_disk()
+        return removed_count
 
     def invalidate_domain(self, domain_intent: str) -> None:
         """Invalidate specific domain bucket on reindex events."""
@@ -436,3 +500,9 @@ def get_savings_ledger() -> SavingsLedger:
 def clear_cache() -> None:
     """Clear all in-memory and disk persistent cache entries."""
     get_cache().clear_all()
+
+
+def invalidate_user_intent_cache(user_id: str, tenant_id: Optional[str] = None) -> int:
+    """Invalidate all intent cache entries for a specific user."""
+    return get_cache().invalidate_user(user_id, tenant_id)
+

@@ -21,7 +21,8 @@ import asyncio
 import json
 import logging
 import os
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Union
 
 import faiss
 import numpy as np
@@ -65,7 +66,17 @@ class VectorStore:
     def ensure_collection(self) -> None:
         os.makedirs(self._dir, exist_ok=True)
         if os.path.exists(self._index_path) and os.path.exists(self._payload_path):
-            self._index = faiss.read_index(self._index_path)
+            raw_idx = faiss.read_index(self._index_path)
+            if not isinstance(raw_idx, (faiss.IndexIDMap, faiss.IndexIDMap2)):
+                n = raw_idx.ntotal
+                d = raw_idx.d
+                vecs = np.zeros((n, d), dtype="float32")
+                raw_idx.reconstruct_n(0, n, vecs)
+                self._index = faiss.IndexIDMap2(faiss.IndexFlatIP(d))
+                ids = np.arange(n, dtype="int64")
+                self._index.add_with_ids(vecs, ids)
+            else:
+                self._index = raw_idx
             with open(self._payload_path, "r", encoding="utf-8") as f:
                 self._payloads = {int(k): v for k, v in json.load(f).items()}
             self._next_id = (max(self._payloads) + 1) if self._payloads else 0
@@ -81,7 +92,17 @@ class VectorStore:
             if master_faiss.exists() and master_pkl.exists():
                 try:
                     logger.info("Auto-hydrating VectorStore from amc_master baseline (%s)", base_engine_dir)
-                    self._index = faiss.read_index(str(master_faiss))
+                    raw_idx = faiss.read_index(str(master_faiss))
+                    if not isinstance(raw_idx, (faiss.IndexIDMap, faiss.IndexIDMap2)):
+                        n = raw_idx.ntotal
+                        d = raw_idx.d
+                        vecs = np.zeros((n, d), dtype="float32")
+                        raw_idx.reconstruct_n(0, n, vecs)
+                        self._index = faiss.IndexIDMap2(faiss.IndexFlatIP(d))
+                        ids = np.arange(n, dtype="int64")
+                        self._index.add_with_ids(vecs, ids)
+                    else:
+                        self._index = raw_idx
                     with open(master_pkl, "rb") as f:
                         master_data = pickle.load(f)
                     children = master_data.get("children", [])
@@ -178,6 +199,8 @@ class VectorStore:
                     "document_title": document_meta.get("title") or document_meta.get("filename"),
                     "doc_type": document_meta.get("doc_type"),
                     "category": document_meta.get("category"),
+                    "user_id": getattr(chunk, "user_id", None) or document_meta.get("user_id"),
+                    "tenant_id": getattr(chunk, "tenant_id", None) or document_meta.get("tenant_id"),
                     "text": chunk.text,
                     "order": chunk.order,
                     "taxonomy_paths": chunk.taxonomy_paths,
@@ -187,21 +210,80 @@ class VectorStore:
             await asyncio.to_thread(self._persist)
         return len(chunks)
 
+    async def add(self, documents: list[dict]) -> list[str]:
+        """Add arbitrary document dicts into the FAISS index."""
+        if not documents:
+            return []
+        if self._index is None:
+            self.ensure_collection()
+        texts = [doc.get("text", "") for doc in documents]
+        vectors = await self.embed_async(texts)
+        matrix = self._matrix(vectors)
+        ids = np.arange(self._next_id, self._next_id + len(documents), dtype="int64")
+
+        chunk_ids: list[str] = []
+        async with self._lock:
+            await asyncio.to_thread(self._index.add_with_ids, matrix, ids)
+            for fid, doc in zip(ids.tolist(), documents):
+                cid = doc.get("chunk_id") or doc.get("id") or f"doc_{fid}"
+                chunk_ids.append(cid)
+                meta = doc.get("metadata") or {}
+                self._payloads[fid] = {
+                    "chunk_id": cid,
+                    "document_id": doc.get("document_id") or meta.get("document_id") or cid,
+                    "document_title": doc.get("document_title") or meta.get("title") or doc.get("title"),
+                    "text": doc.get("text", ""),
+                    "user_id": doc.get("user_id") or meta.get("user_id"),
+                    "tenant_id": doc.get("tenant_id") or meta.get("tenant_id"),
+                    "indexed_at": meta.get("indexed_at"),
+                    "metadata": meta,
+                    "order": doc.get("order", fid),
+                    "taxonomy_paths": doc.get("taxonomy_paths") or meta.get("taxonomy_paths") or [],
+                    "entity_ids": doc.get("entity_ids") or meta.get("entity_ids") or [],
+                }
+            self._next_id += len(documents)
+            await asyncio.to_thread(self._persist)
+        return chunk_ids
+
+    async def add_documents(
+        self,
+        documents: list[dict],
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> list[str]:
+        """Add documents with injected ownership metadata."""
+        for doc in documents:
+            if "metadata" not in doc:
+                doc["metadata"] = {}
+            if user_id:
+                doc["metadata"]["user_id"] = user_id
+                doc["user_id"] = user_id
+            if tenant_id:
+                doc["metadata"]["tenant_id"] = tenant_id
+                doc["tenant_id"] = tenant_id
+            doc["metadata"]["indexed_at"] = datetime.now(timezone.utc).isoformat()
+        return await self.add(documents)
+
     # ---------- search ----------
 
     async def search(
         self,
-        query: str,
+        query: Union[str, list[float]],
         top_k: int = 8,
         taxonomy_paths: Optional[list[str]] = None,
         entity_names: Optional[list[str]] = None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        metadata_filter: Optional[dict] = None,
     ) -> list[dict]:
-        """Semantic search, optionally scoped by taxonomy branch (Python post-filter).
-        Degrades to unscoped search when the taxonomy scope yields nothing."""
+        """Semantic search, optionally scoped by taxonomy branch and filtered by user/tenant."""
         if self._index is None or self._index.ntotal == 0:
             return []
-        vec = self._matrix(await self.embed_async([query]))
-        # Over-fetch so the taxonomy post-filter still has candidates to return.
+        if isinstance(query, (list, np.ndarray)):
+            vec = self._matrix([query])
+        else:
+            vec = self._matrix(await self.embed_async([query]))
+
         fetch = min(self._index.ntotal, max(top_k * 5, top_k))
         scores, ids = await asyncio.to_thread(self._index.search, vec, fetch)
 
@@ -213,6 +295,36 @@ class VectorStore:
                 payload = self._payloads.get(fid)
                 if payload is None:
                     continue
+
+                # User isolation:
+                # Documents with a user_id are private to that user.
+                # Documents without user_id (system/corpus) are public.
+                doc_user = payload.get("user_id")
+                if user_id:
+                    if doc_user is not None and doc_user != user_id:
+                        continue
+                elif doc_user is not None:
+                    continue
+
+                # Tenant isolation:
+                doc_tenant = payload.get("tenant_id")
+                if tenant_id:
+                    if doc_tenant is not None and doc_tenant != tenant_id:
+                        continue
+                elif doc_tenant is not None:
+                    continue
+
+                # Metadata filter:
+                if metadata_filter:
+                    match = True
+                    meta = payload.get("metadata") or {}
+                    for mk, mv in metadata_filter.items():
+                        if payload.get(mk) != mv and meta.get(mk) != mv:
+                            match = False
+                            break
+                    if not match:
+                        continue
+
                 if apply_scope and taxonomy_paths:
                     if not set(payload.get("taxonomy_paths") or []) & set(taxonomy_paths):
                         continue
@@ -226,13 +338,89 @@ class VectorStore:
             hits = _collect(apply_scope=False)
         return hits
 
-    async def list_documents(self) -> list[dict]:
-        """Distinct documents present in the index (for /docs and /status)."""
+    async def similarity_search(
+        self,
+        embedding: Optional[list[float]] = None,
+        query: Optional[str] = None,
+        limit: int = 10,
+        metadata_filter: Optional[dict] = None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> list[dict]:
+        """Similarity search by embedding or query text with metadata filtering."""
+        if self._index is None or self._index.ntotal == 0:
+            return []
+        if embedding is not None:
+            vec = self._matrix([embedding])
+        elif query is not None:
+            vec = self._matrix(await self.embed_async([query]))
+        else:
+            return []
+
+        fetch = min(self._index.ntotal, max(limit * 5, limit))
+        scores, ids = await asyncio.to_thread(self._index.search, vec, fetch)
+
+        out: list[dict] = []
+        for score, fid in zip(scores[0].tolist(), ids[0].tolist()):
+            if fid == -1:
+                continue
+            payload = self._payloads.get(fid)
+            if payload is None:
+                continue
+
+            doc_user = payload.get("user_id")
+            if user_id:
+                if doc_user is not None and doc_user != user_id:
+                    continue
+            elif doc_user is not None:
+                continue
+
+            doc_tenant = payload.get("tenant_id")
+            if tenant_id:
+                if doc_tenant is not None and doc_tenant != tenant_id:
+                    continue
+            elif doc_tenant is not None:
+                continue
+
+            if metadata_filter:
+                match = True
+                meta = payload.get("metadata") or {}
+                for mk, mv in metadata_filter.items():
+                    if payload.get(mk) != mv and meta.get(mk) != mv:
+                        match = False
+                        break
+                if not match:
+                    continue
+
+            out.append({"chunk_id": payload["chunk_id"], "score": float(score), **payload})
+            if len(out) >= limit:
+                break
+        return out
+
+    async def list_documents(
+        self,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> list[dict]:
+        """Distinct documents present in the index, scoped by user and tenant."""
         docs: dict[str, dict] = {}
         for payload in self._payloads.values():
             doc_id = payload.get("document_id")
             if not doc_id:
                 continue
+            doc_user = payload.get("user_id")
+            if user_id:
+                if doc_user is not None and doc_user != user_id:
+                    continue
+            elif doc_user is not None:
+                continue
+            doc_tenant = payload.get("tenant_id")
+            if tenant_id:
+                if doc_tenant is not None and doc_tenant != tenant_id:
+                    continue
+            elif doc_tenant is not None:
+                continue
+
             entry = docs.setdefault(doc_id, {
                 "document_id": doc_id,
                 "title": payload.get("document_title"),
@@ -247,20 +435,179 @@ class VectorStore:
             entry["taxonomy_paths"] = sorted(entry["taxonomy_paths"])
         return list(docs.values())
 
-    async def get_document_chunks(self, document_id: str) -> list[dict]:
-        chunks = [
-            {"chunk_id": p["chunk_id"], "text": p.get("text", ""), "order": p.get("order", 0)}
-            for p in self._payloads.values()
-            if p.get("document_id") == document_id
-        ]
+    async def get_document_chunks(
+        self,
+        document_id: str,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> list[dict]:
+        chunks = []
+        for p in self._payloads.values():
+            if p.get("document_id") != document_id:
+                continue
+            doc_user = p.get("user_id")
+            if user_id:
+                if doc_user is not None and doc_user != user_id:
+                    continue
+            elif doc_user is not None:
+                continue
+            doc_tenant = p.get("tenant_id")
+            if tenant_id:
+                if doc_tenant is not None and doc_tenant != tenant_id:
+                    continue
+            elif doc_tenant is not None:
+                continue
+            chunks.append({"chunk_id": p["chunk_id"], "text": p.get("text", ""), "order": p.get("order", 0)})
         return sorted(chunks, key=lambda c: c["order"])
+
+
+class UserScopedVectorStore:
+    """Vector store wrapper with user/tenant metadata filtering."""
+
+    def __init__(
+        self,
+        base_client: VectorStore,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> None:
+        self.client = base_client
+        self.user_id = user_id
+        self.tenant_id = tenant_id
+
+    async def search(
+        self,
+        query: Union[str, list[float]],
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        top_k: int = 8,
+        limit: Optional[int] = None,
+        taxonomy_paths: Optional[list[str]] = None,
+        entity_names: Optional[list[str]] = None,
+        metadata_filter: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Search vector store with user/tenant filtering."""
+        eff_user = user_id if user_id is not None else self.user_id
+        eff_tenant = tenant_id if tenant_id is not None else self.tenant_id
+        eff_k = limit if limit is not None else top_k
+
+        if isinstance(query, (list, np.ndarray)):
+            return await self.client.similarity_search(
+                embedding=query,
+                limit=eff_k,
+                metadata_filter=metadata_filter,
+                user_id=eff_user,
+                tenant_id=eff_tenant,
+            )
+
+        return await self.client.search(
+            query=query,
+            top_k=eff_k,
+            taxonomy_paths=taxonomy_paths,
+            entity_names=entity_names,
+            user_id=eff_user,
+            tenant_id=eff_tenant,
+            metadata_filter=metadata_filter,
+            **kwargs,
+        )
+
+    async def similarity_search(
+        self,
+        embedding: Optional[list[float]] = None,
+        query: Optional[str] = None,
+        limit: int = 10,
+        metadata_filter: Optional[dict] = None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Search with user/tenant metadata filter."""
+        eff_user = user_id if user_id is not None else self.user_id
+        eff_tenant = tenant_id if tenant_id is not None else self.tenant_id
+        return await self.client.similarity_search(
+            embedding=embedding,
+            query=query,
+            limit=limit,
+            metadata_filter=metadata_filter,
+            user_id=eff_user,
+            tenant_id=eff_tenant,
+        )
+
+    async def add_documents(
+        self,
+        documents: list[dict[str, Any]],
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> list[str]:
+        """Add documents to vector store with ownership metadata."""
+        eff_user = user_id if user_id is not None else self.user_id
+        eff_tenant = tenant_id if tenant_id is not None else self.tenant_id
+        return await self.client.add_documents(documents, user_id=eff_user, tenant_id=eff_tenant)
+
+    async def add(
+        self,
+        documents: list[dict[str, Any]],
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> list[str]:
+        """Add documents with ownership metadata."""
+        eff_user = user_id if user_id is not None else self.user_id
+        eff_tenant = tenant_id if tenant_id is not None else self.tenant_id
+        return await self.client.add_documents(documents, user_id=eff_user, tenant_id=eff_tenant)
+
+    async def index_chunks(
+        self,
+        chunks: list[Chunk],
+        document_meta: dict,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> int:
+        """Index chunks with user and tenant metadata."""
+        eff_user = user_id if user_id is not None else self.user_id
+        eff_tenant = tenant_id if tenant_id is not None else self.tenant_id
+        meta = dict(document_meta)
+        if eff_user and "user_id" not in meta:
+            meta["user_id"] = eff_user
+        if eff_tenant and "tenant_id" not in meta:
+            meta["tenant_id"] = eff_tenant
+        return await self.client.index_chunks(chunks, meta)
+
+    async def list_documents(
+        self,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> list[dict]:
+        eff_user = user_id if user_id is not None else self.user_id
+        eff_tenant = tenant_id if tenant_id is not None else self.tenant_id
+        return await self.client.list_documents(user_id=eff_user, tenant_id=eff_tenant)
+
+    async def get_document_chunks(
+        self,
+        document_id: str,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> list[dict]:
+        eff_user = user_id if user_id is not None else self.user_id
+        eff_tenant = tenant_id if tenant_id is not None else self.tenant_id
+        return await self.client.get_document_chunks(document_id, user_id=eff_user, tenant_id=eff_tenant)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.client, name)
 
 
 _vector_store: Optional[VectorStore] = None
 
 
-def get_vector_store() -> VectorStore:
+def get_base_vector_store() -> VectorStore:
     global _vector_store
     if _vector_store is None:
         _vector_store = VectorStore()
     return _vector_store
+
+
+def get_vector_store(
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> UserScopedVectorStore:
+    base = get_base_vector_store()
+    return UserScopedVectorStore(base, user_id=user_id, tenant_id=tenant_id)
+

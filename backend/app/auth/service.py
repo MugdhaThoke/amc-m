@@ -38,6 +38,7 @@ class AuthenticatedUser:
     email: str
     avatar_initials: str
     status: str
+    tenant_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,7 @@ class AuthService:
             email=record.email,
             avatar_initials=record.avatar_initials,
             status=record.status,
+            tenant_id=getattr(record, "tenant_id", None),
         )
 
     def authenticate(self, username: str, password: str, remember_me: bool = False) -> AuthResult:
@@ -104,13 +106,22 @@ class AuthService:
         logger.info("Successful login for username=%r", username)
         return AuthResult(success=True, user=self._to_public(record), token=token, expires_at=expires_at)
 
-    def resolve_session(self, token: str) -> Optional[AuthenticatedUser]:
+    def resolve_session_with_status(self, token: str) -> tuple[Optional[AuthenticatedUser], Optional[str]]:
+        """Resolves session token returning (user, error_code).
+        error_code: None, 'invalid_token', or 'inactive_account'.
+        """
         if not token:
-            return None
+            return None, "invalid_token"
         payload = resolve_session_token(token, self._secret_key)
         if payload is None:
-            return None
+            return None, "invalid_token"
         record = self._repository.get_by_username(payload.username)
-        if record is None or record.status.lower() != "active":
-            return None
-        return self._to_public(record)
+        if record is None:
+            return None, "invalid_token"
+        if record.status.lower() != "active":
+            return None, "inactive_account"
+        return self._to_public(record), None
+
+    def resolve_session(self, token: str) -> Optional[AuthenticatedUser]:
+        user, _ = self.resolve_session_with_status(token)
+        return user

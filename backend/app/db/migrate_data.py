@@ -450,7 +450,8 @@ def populate_chat_sessions_and_query_evidence(db: Session) -> tuple[int, int]:
                     if not existing_sess:
                         session_row = ChatSession(
                             session_id=sid,
-                            user_id=sess_info.get("user_id"),
+                            user_id=sess_info.get("user_id") or "system_migration",
+                            tenant_id=sess_info.get("tenant_id"),
                             created_at=sess_info.get("created_at", _now()),
                             updated_at=sess_info.get("updated_at", _now()),
                             ended_at=sess_info.get("ended_at"),
@@ -474,7 +475,8 @@ def populate_chat_sessions_and_query_evidence(db: Session) -> tuple[int, int]:
                     if t_sid and not db.query(ChatSession).filter_by(session_id=t_sid).first():
                         db.add(ChatSession(
                             session_id=t_sid,
-                            user_id="default_user",
+                            user_id=t.get("user_id") or "system_migration",
+                            tenant_id=t.get("tenant_id"),
                             created_at=_now(),
                             updated_at=_now(),
                             audit_id=default_audit_id,
@@ -485,6 +487,8 @@ def populate_chat_sessions_and_query_evidence(db: Session) -> tuple[int, int]:
                     q_ev = QueryEvidence(
                         response_id=resp_id,
                         session_id=t_sid,
+                        user_id=t.get("user_id") or "system_migration",
+                        tenant_id=t.get("tenant_id"),
                         request_id=t.get("request_id"),
                         query_text=t.get("query_text", ""),
                         query_type=t.get("query_type"),
@@ -522,6 +526,7 @@ def populate_chat_sessions_and_query_evidence(db: Session) -> tuple[int, int]:
                     db.add(ChatSession(
                         session_id=sid,
                         user_id="user_chat_session",
+                        tenant_id=None,
                         created_at=_now(),
                         updated_at=_now(),
                         audit_id=default_audit_id,

@@ -9,6 +9,9 @@
 exposes FastAPI dependencies."""
 import json
 from pathlib import Path
+from typing import Annotated, Optional
+
+from fastapi import Depends, Header, HTTPException, status
 
 from app.config import get_settings
 from app.core.llm import get_llm_client
@@ -111,14 +114,27 @@ _auth_service: "AuthService | None" = None
 
 
 def get_auth_service() -> "AuthService":
-    """FastAPI dependency — returns the process-wide `AuthService` singleton."""
+    """FastAPI dependency — returns the process-wide `AuthService` singleton.
+    
+    Uses SQL-backed user repository by default (auth_use_database=True).
+    Falls back to JSON repository for backward compatibility if needed.
+    """
     global _auth_service
     if _auth_service is None:
-        from app.auth.repository import JSONUserRepository
         from app.auth.service import AuthService
 
         settings = get_settings()
-        repository = JSONUserRepository(Path(settings.auth_users_path)) if settings.auth_users_path else JSONUserRepository()
+        
+        # Use database-backed repository by default
+        if settings.auth_use_database:
+            from app.auth.sql_repository import SqlUserRepository
+            from app.core.database import SessionLocal
+            repository = SqlUserRepository(session_factory=SessionLocal)
+        else:
+            # Fallback to JSON repository for backward compatibility
+            from app.auth.repository import JSONUserRepository
+            repository = JSONUserRepository(Path(settings.auth_users_path)) if settings.auth_users_path else JSONUserRepository()
+        
         _auth_service = AuthService(
             repository=repository,
             secret_key=settings.auth_secret_key,
@@ -128,20 +144,80 @@ def get_auth_service() -> "AuthService":
     return _auth_service
 
 
-# To protect a future route with the same session token used by /api/auth/me,
-# depend on `get_auth_service` directly and resolve the bearer token inline:
-#
-#     from fastapi import Header, Depends
-#     from app.api.deps import get_auth_service
-#     from app.auth.service import AuthService
-#
-#     async def my_route(
-#         authorization: str | None = Header(default=None),
-#         auth_service: AuthService = Depends(get_auth_service),
-#     ):
-#         token = (authorization or "").removeprefix("Bearer ").strip()
-#         user = auth_service.resolve_session(token)
-#         ...
-#
-# Not wired into any existing route yet — the current app gates access
-# client-side after login (see api/routes/auth.py + frontend AppState).
+from app.auth.service import AuthService, AuthenticatedUser
+
+
+async def get_current_user(
+    authorization: Optional[str] = Header(None, description="Bearer token required"),
+    auth_service: AuthService = Depends(get_auth_service),
+) -> AuthenticatedUser:
+    """
+    FastAPI dependency that extracts and validates the JWT/session token.
+    Enforces mandatory Bearer token authentication (no unverified header fallbacks).
+
+    Raises:
+        HTTPException(401): If token is missing, invalid, or expired
+        HTTPException(403): If user account is inactive
+
+    Returns:
+        AuthenticatedUser: Verified user identity with username, role, department
+    """
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token format",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token format",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user, error = auth_service.resolve_session_with_status(token)
+    if error == "inactive_account":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User account is inactive",
+        )
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return user
+
+
+# Type alias for cleaner route signatures
+CurrentUser = Annotated[AuthenticatedUser, Depends(get_current_user)]
+
+
+async def get_current_user_optional(
+    authorization: Optional[str] = Header(None, description="Optional bearer token"),
+    auth_service: AuthService = Depends(get_auth_service),
+) -> Optional[AuthenticatedUser]:
+    """Optional user dependency that returns None instead of raising 401 when unauthenticated."""
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+        if token:
+            user, _ = auth_service.resolve_session_with_status(token)
+            if user:
+                return user
+    return None
+
+
+OptionalCurrentUser = Annotated[Optional[AuthenticatedUser], Depends(get_current_user_optional)]
+

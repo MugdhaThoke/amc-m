@@ -7,7 +7,7 @@
 
 import hashlib
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 from app.engine import config
 from app.engine.llm_text_client import call_llm_with_usage
 
@@ -23,10 +23,36 @@ _HYDE_CACHE: Dict[str, Tuple[str, float]] = {}  # {cache_key: (result, timestamp
 _HYDE_TTL = 3600  # 1 hour
 _HYDE_MAX_CACHE_SIZE = 5000
 
-def _get_cache_key(query: str) -> str:
+
+def clear_hyde_cache():
+    """Clears HyDE cache."""
+    global _HYDE_CACHE
+    _HYDE_CACHE.clear()
+
+
+def invalidate_user_hyde_cache(user_id: str, tenant_id: Optional[str] = None) -> int:
+    """Invalidate HyDE cache entries for a specific user."""
+    from app.core.cache_utils import invalidate_user_cache
+    return invalidate_user_cache(_HYDE_CACHE, "hyde", user_id, tenant_id)
+
+
+def _get_cache_key(
+    query: str,
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> str:
     """Normalize first 30 words to match semantically equivalent query prefixes."""
     query_norm = " ".join(query.strip().lower().split()[:30])
+    if user_id:
+        from app.core.cache_utils import generate_cache_key
+        return generate_cache_key(
+            namespace="hyde",
+            key_components={"query": query_norm},
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
     return hashlib.md5(query_norm.encode("utf-8")).hexdigest()
+
 
 def _prune_cache_if_needed():
     """Evict oldest entries when cache reaches capacity."""
@@ -36,14 +62,19 @@ def _prune_cache_if_needed():
         for key, _ in oldest:
             _HYDE_CACHE.pop(key, None)
 
-def generate_hypothetical_document(query: str) -> Tuple[str, float]:
+
+def generate_hypothetical_document(
+    query: str,
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> Tuple[str, float]:
     """
     Calls the LLM to generate a hypothetical document for the given query,
-    with an in-memory MD5 prefix cache for sub-millisecond repeated queries.
+    with an in-memory user-scoped cache for sub-millisecond repeated queries.
     Returns (hypothetical_document_text, latency_ms).
     """
     t0 = time.perf_counter()
-    cache_key = _get_cache_key(query)
+    cache_key = _get_cache_key(query, user_id=user_id, tenant_id=tenant_id)
     now = time.time()
 
     # Tier 1: Cache check

@@ -57,6 +57,8 @@ class AdaptiveRetriever:
         resolved_entities: Optional[List[str]] = None,
         original_threshold: float = 0.45,
         relaxed_threshold: float = 0.30,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[Any]:
         """
         Execute Round 2 retrieval with relaxed similarity floor and expanded query permutations.
@@ -82,12 +84,19 @@ class AdaptiveRetriever:
                     search_query,
                     top_k=top_k * 2,
                     similarity_threshold=relaxed_threshold,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
                 )
                 if res:
                     candidates.extend(res)
             except TypeError:
                 # Store signature might not take similarity_threshold
-                res = await self.vector_store.search(search_query, top_k=top_k * 2)
+                res = await self.vector_store.search(
+                    search_query,
+                    top_k=top_k * 2,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                )
                 if res:
                     candidates.extend(res)
             except Exception as exc:
@@ -98,7 +107,12 @@ class AdaptiveRetriever:
         for var in variations[:2]:  # cap at 2 expansions to keep low latency
             if self.vector_store is not None and hasattr(self.vector_store, "search"):
                 try:
-                    var_hits = await self.vector_store.search(f"{query} {var}", top_k=3)
+                    var_hits = await self.vector_store.search(
+                        f"{query} {var}",
+                        top_k=3,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                    )
                     if var_hits:
                         candidates.extend(var_hits)
                 except Exception:

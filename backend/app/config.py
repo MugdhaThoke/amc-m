@@ -144,7 +144,9 @@ class Settings(BaseSettings):
     auth_secret_key: str = "dev-only-insecure-secret-change-me"
     auth_session_ttl_minutes: int = 480               # 8h; "Remember Me" uses a longer client-side TTL
     auth_session_ttl_minutes_remember: int = 20_160    # 14 days
-    auth_users_path: str = "app/auth/data/users.json"  # JSON store today; swap for a DB repository later
+    auth_users_path: str = "app/auth/data/users.json"  # Deprecated: kept for backward compatibility
+    auth_use_database: bool = True                    # Use database-backed user repository instead of JSON
+    enable_user_scoped_authorization: bool = True     # Master feature flag for user-scoped authorization and tenant isolation
 
     @model_validator(mode="after")
     def _resolve_secret_from_aws(self) -> "Settings":

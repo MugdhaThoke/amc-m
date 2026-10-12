@@ -1,0 +1,42 @@
+[
+  {
+    "username": "sarah_compliance",
+    "full_name": "Sarah Jenkins",
+    "role": "Compliance & Regulatory Officer",
+    "department": "Regulatory & Legal Compliance",
+    "email": "s.jenkins@amc.com",
+    "status": "Active"
+  },
+  {
+    "username": "compliance_officer",
+    "full_name": "Chief Compliance Officer",
+    "role": "Compliance & Regulatory Officer",
+    "department": "Compliance & Legal",
+    "email": "compliance@amc.com",
+    "status": "Active"
+  },
+  {
+    "username": "amc_auditor",
+    "full_name": "Senior AMC Auditor",
+    "role": "Compliance & Regulatory Officer",
+    "department": "Internal Audit",
+    "email": "auditor@amc.com",
+    "status": "Active"
+  },
+  {
+    "username": "amc_researcher",
+    "full_name": "Investment Researcher",
+    "role": "Fund Manager / Portfolio Manager",
+    "department": "Equity Research",
+    "email": "research@amc.com",
+    "status": "Active"
+  },
+  {
+    "username": "vikram_pm",
+    "full_name": "Vikram P",
+    "role": "Fund Manager / Portfolio Manager",
+    "department": "Research & Devlopement",
+    "email": "vikram.p@amc.com",
+    "status": "Active"
+  }
+]

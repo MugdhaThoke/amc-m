@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
-from app.api.deps import Container, get_container
+from app.api.deps import Container, CurrentUser, get_container, get_current_user
 from app.api.routes.files import get_pdf_url
 from app.api.routes.query import (
     _contextgraph_response,
@@ -84,7 +84,28 @@ async def _trigger_follow_up_detection(
         logger.warning("Passive follow-up detection failed: %s", exc)
 
 
-async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatResponse:
+async def _run_v2_chat(
+    request: ChatRequest,
+    container: Container,
+    current_user: Optional[CurrentUser] = None,
+) -> ChatResponse:
+    if request.session_id and current_user:
+        from app.core.database import SessionLocal
+        from app.schemas.chat_sessions_table import ChatSession
+        with SessionLocal() as db:
+            existing_sess = db.query(ChatSession).filter_by(session_id=request.session_id).first()
+            if existing_sess:
+                if existing_sess.user_id != current_user.username:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Session {request.session_id} not found",
+                    )
+                if current_user.tenant_id and existing_sess.tenant_id != current_user.tenant_id:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Session {request.session_id} not found",
+                    )
+
     query = request.query
     history = request.history
     session_id = request.session_id
@@ -94,6 +115,8 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
         query=query,
         history=history,
         session_id=session_id,
+        user_id=current_user.username if current_user else None,
+        tenant_id=current_user.tenant_id if current_user else None,
     )
     intent = resp_obj.intent
     retrieval_res = resp_obj.retrieval
@@ -283,11 +306,49 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
         for f in graph_facts
     ]
 
-    cross_val_ledger = {
-        "cross_validation_badge": {"label": "Pillar 5: Verified Grounding", "type": "success", "desc": "Grounded against active corpus."},
-        "evidence_status": "SUPPORTED",
-        "metrics": [],
-    }
+    # Cross-validate answer against retrieved documents and graph facts
+    ans_text_for_cv = synthesis.answer if synthesis else ""
+    docs_for_cv = []
+    for i, s in enumerate(sources):
+        if isinstance(s, dict):
+            d_name = s.get("document_title") or s.get("name") or s.get("document_id") or f"Doc {i+1}"
+            d_page = s.get("page_number") if s.get("page_number") is not None else s.get("page")
+            d_snippet = s.get("snippet", "")
+            d_text = s.get("verbatim_text") or s.get("full_text") or s.get("snippet", "")
+        else:
+            d_name = getattr(s, "document_title", None) or getattr(s, "document_id", None) or getattr(s, "name", None) or f"Doc {i+1}"
+            d_page = getattr(s, "page_number", None) if getattr(s, "page_number", None) is not None else getattr(s, "page", None)
+            d_snippet = getattr(s, "snippet", "") or ""
+            d_text = getattr(s, "verbatim_text", "") or getattr(s, "full_text", "") or getattr(s, "snippet", "") or ""
+        docs_for_cv.append({
+            "name": d_name,
+            "document_title": d_name,
+            "page": d_page,
+            "snippet": d_snippet,
+            "full_text": d_text,
+        })
+    try:
+        from app.engine.cross_validation import cross_validate_answer
+        cv_report = cross_validate_answer(
+            query=query,
+            answer=ans_text_for_cv,
+            retrieved_docs=docs_for_cv,
+            graph_triplets=triplet_table,
+            query_type=intent.query_type.value if intent else "v2",
+        )
+        cross_val_ledger = cv_report
+        metrics_list = cv_report.get("metrics", [])
+    except Exception as cv_exc:
+        logger.warning("Cross-validation failed in _run_v2_chat: %s", cv_exc)
+        cross_val_ledger = {
+            "cross_validation_badge": {"label": "Pillar 5: Verified Grounding", "type": "success", "desc": "Grounded against active corpus."},
+            "evidence_status": "SUPPORTED",
+            "metrics": getattr(synthesis, "metrics", []) if synthesis else [],
+        }
+        metrics_list = cross_val_ledger["metrics"]
+
+    if synthesis:
+        synthesis.metrics = metrics_list
 
     # Token counts
     total_tokens = (trace.input_tokens + trace.output_tokens) if trace else 0
@@ -341,10 +402,12 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
             "compliance_note": confidence_label,
             "confidence": conf_str,
             "citations": citations_list,
+            "metrics": metrics_list,
         },
         # sources list — one entry per context source
         "sources": sources,
         "citations": citations_list,
+        "metrics": metrics_list,
         # graph_highlight — full legacy-compatible dict; adapters read everything from here
         "graph_highlight": {
             "node_names": graph_nodes,
@@ -363,6 +426,8 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
             "total_tokens": total_tokens,
             "telemetry_breakdown": telemetry_breakdown,
             "provenance": provenance_list,
+            "metrics": metrics_list,
+            "cross_val_ledger": cross_val_ledger,
         },
         "latency_ms": int(trace.request_total_ms if trace else 0),
         "confidence_label": confidence_label,
@@ -381,6 +446,8 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
             intent=intent,
             trace=trace,
             serving_engine="v2",
+            user_id=current_user.username if current_user else "system_user",
+            tenant_id=current_user.tenant_id if current_user else None,
         )
         # Feedback timer & lifecycle management in data.db
         try:
@@ -464,25 +531,28 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
 async def run_chat_v2(
     request: ChatRequest,
     response: Response,
+    current_user: CurrentUser,
     container: Container = Depends(get_container),
 ) -> ChatResponse:
     """Explicit v2 multi-turn chat endpoint."""
-    resp = await _run_v2_chat(request, container)
+    resp = await _run_v2_chat(request, container, current_user=current_user)
     response.headers["X-Serving-Engine"] = resp.serving_engine or "v2"
     return resp
 
 
+@router.post("/query", response_model=ChatResponse)
 @router.post("", response_model=ChatResponse)
 async def run_chat(
     request: ChatRequest,
     response: Response,
+    current_user: CurrentUser,
     container: Container = Depends(get_container),
 ) -> ChatResponse:
     """Multi-turn chat endpoint with QUERY_ENGINE routing."""
     engine = container.settings.query_engine.lower()
 
     if engine == "v2":
-        resp = await _run_v2_chat(request, container)
+        resp = await _run_v2_chat(request, container, current_user=current_user)
         response.headers["X-Serving-Engine"] = resp.serving_engine or "v2"
         return resp
 
@@ -492,7 +562,7 @@ async def run_chat(
         routing_key = request.session_id or request.query
         bucket = zlib.crc32(routing_key.encode("utf-8")) % 100
         if bucket < canary_pct:
-            resp = await _run_v2_chat(request, container)
+            resp = await _run_v2_chat(request, container, current_user=current_user)
             resp.serving_engine = f"canary-v2 ({canary_pct}%)"
             response.headers["X-Serving-Engine"] = resp.serving_engine
             return resp
@@ -505,6 +575,23 @@ async def run_chat(
             legacy_result={},
             orchestrator=container.orchestrator,
         )
+
+    if request.session_id and current_user:
+        from app.core.database import SessionLocal
+        from app.schemas.chat_sessions_table import ChatSession
+        with SessionLocal() as db:
+            existing_sess = db.query(ChatSession).filter_by(session_id=request.session_id).first()
+            if existing_sess:
+                if existing_sess.user_id != current_user.username:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Session {request.session_id} not found",
+                    )
+                if current_user.tenant_id and existing_sess.tenant_id != current_user.tenant_id:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Session {request.session_id} not found",
+                    )
 
     store = _get_store()
 
@@ -590,6 +677,8 @@ async def run_chat(
             result=ctx_result,
             hybrid=resp.hybrid,
             serving_engine="legacy",
+            user_id=current_user.username,
+            tenant_id=current_user.tenant_id,
         )
 
     if resp.response_id:
@@ -624,7 +713,11 @@ def _format_sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
-async def _chat_stream_generator(request: "ChatRequest", container: Container):
+async def _chat_stream_generator(
+    request: "ChatRequest",
+    container: Container,
+    current_user: Optional[CurrentUser] = None,
+):
     """Async generator for multi-turn chat streaming with full ContextGraph fidelity."""
     engine = container.settings.query_engine.lower()
     if engine == "v2":
@@ -639,6 +732,8 @@ async def _chat_stream_generator(request: "ChatRequest", container: Container):
                 top_k=None,
                 history=request.history,
                 session_id=request.session_id,
+                user_id=current_user.username if current_user else None,
+                tenant_id=current_user.tenant_id if current_user else None,
             ):
                 event_type = event.get("type", "chunk")
                 if event_type == "metadata":
@@ -730,11 +825,42 @@ async def _chat_stream_generator(request: "ChatRequest", container: Container):
                         "type": "success"
                     })
 
-                    cross_val_ledger = {
-                        "cross_validation_badge": {"label": "Pillar 5: Verified Grounding", "type": "success", "desc": "Grounded against active corpus."},
-                        "evidence_status": "SUPPORTED",
-                        "metrics": [],
-                    }
+                    confidence_label = "✓ High confidence"
+                    ans_text = complete_answer.get("answer") if complete_answer else "".join(answer_parts).strip()
+
+                    # Extract metrics and cross-validation ledger from stream or run cross-validation
+                    metrics_from_stream = event.get("metrics") or (complete_answer.get("metrics") if complete_answer else None)
+                    cross_val_ledger = event.get("cross_validation_ledger")
+                    if not metrics_from_stream or not cross_val_ledger:
+                        try:
+                            from app.engine.cross_validation import cross_validate_answer
+                            docs_for_cv = [
+                                {
+                                    "name": s.get("document_title") or s.get("name") or s.get("document_id") or f"Doc {i+1}",
+                                    "document_title": s.get("document_title") or s.get("name") or s.get("document_id") or f"Doc {i+1}",
+                                    "page": s.get("page_number") if s.get("page_number") is not None else s.get("page"),
+                                    "snippet": s.get("snippet", ""),
+                                    "full_text": s.get("verbatim_text") or s.get("full_text") or s.get("snippet", ""),
+                                }
+                                for i, s in enumerate(complete_sources if complete_sources else stream_sources)
+                            ]
+                            cv_report = cross_validate_answer(
+                                query=request.query,
+                                answer=ans_text,
+                                retrieved_docs=docs_for_cv,
+                                graph_triplets=triplet_table,
+                                query_type=dom_intent,
+                            )
+                            cross_val_ledger = cv_report
+                            metrics_from_stream = cv_report.get("metrics", [])
+                        except Exception as cv_exc:
+                            logger.warning("Stream cross validation failed: %s", cv_exc)
+                            metrics_from_stream = []
+                            cross_val_ledger = {
+                                "cross_validation_badge": {"label": "Pillar 5: Verified Grounding", "type": "success", "desc": "Grounded against active corpus."},
+                                "evidence_status": "SUPPORTED",
+                                "metrics": [],
+                            }
 
                     # Entity-type summary
                     from collections import defaultdict
@@ -777,9 +903,6 @@ async def _chat_stream_generator(request: "ChatRequest", container: Container):
                         "cross_validation_ledger": cross_val_ledger,
                     }
 
-                    confidence_label = "✓ High confidence"
-                    ans_text = complete_answer.get("answer") if complete_answer else "".join(answer_parts).strip()
-
                     hybrid_data_complete = {
                         "response_id": event.get("response_id"),
                         "interaction_id": event.get("response_id"),
@@ -789,7 +912,9 @@ async def _chat_stream_generator(request: "ChatRequest", container: Container):
                             "compliance_note": confidence_label,
                             "citations": complete_citations,
                             "structured_rows": complete_answer.get("structured_rows", []) if complete_answer else [],
+                            "metrics": metrics_from_stream,
                         },
+                        "metrics": metrics_from_stream,
                         "sources": complete_sources if complete_sources else stream_sources,
                         "citations": complete_citations,
                         "graph_nodes": complete_nodes,
@@ -811,6 +936,8 @@ async def _chat_stream_generator(request: "ChatRequest", container: Container):
                             "total_tokens": total_toks,
                             "telemetry_breakdown": telemetry_breakdown,
                             "provenance": provenance_list,
+                            "metrics": metrics_from_stream,
+                            "cross_val_ledger": cross_val_ledger,
                         },
                         "latency_ms": complete_trace.get("request_total_ms"),
                         "confidence_label": confidence_label,
@@ -830,6 +957,8 @@ async def _chat_stream_generator(request: "ChatRequest", container: Container):
                         },
                         trace=complete_trace,
                         serving_engine="v2-stream",
+                        user_id=current_user.username if current_user else "system_user",
+                        tenant_id=current_user.tenant_id if current_user else None,
                     )
                     
                     # Register with SessionManager for passive feedback detection
@@ -967,6 +1096,8 @@ async def _chat_stream_generator(request: "ChatRequest", container: Container):
                 result=ctx_result,
                 hybrid=hybrid_payload,
                 serving_engine="legacy-stream",
+                user_id=current_user.username if current_user else "system_user",
+                tenant_id=current_user.tenant_id if current_user else None,
             )
 
             # Signal completion with metadata for SessionManager registration
@@ -1045,6 +1176,7 @@ async def _chat_stream_generator(request: "ChatRequest", container: Container):
 @router.post("/stream", response_class=StreamingResponse)
 async def chat_stream(
     request: ChatRequest,
+    current_user: CurrentUser,
     container: Container = Depends(get_container),
 ) -> StreamingResponse:
     """Server-Sent Events streaming endpoint for /chat.
@@ -1055,10 +1187,32 @@ async def chat_stream(
     Event types match /query/stream for frontend symmetry:
       event: metadata, sources, chunk, done, error
     """
+    if request.session_id and current_user:
+        from app.core.database import SessionLocal
+        from app.schemas.chat_sessions_table import ChatSession
+        with SessionLocal() as db:
+            existing_sess = db.query(ChatSession).filter_by(session_id=request.session_id).first()
+            if existing_sess:
+                if existing_sess.user_id != current_user.username or (current_user.tenant_id and existing_sess.tenant_id != current_user.tenant_id):
+                    fresh_sid = f"sess_{uuid.uuid4().hex[:12]}"
+                    logger.warning(
+                        "Session %s is owned by '%s', but request is from '%s'. Reassigning to fresh session %s for tenant isolation.",
+                        request.session_id,
+                        existing_sess.user_id,
+                        current_user.username,
+                        fresh_sid,
+                    )
+                    request.session_id = fresh_sid
+                    request.history = []
+
+    stream_headers = dict(_STREAM_HEADERS)
+    if request.session_id:
+        stream_headers["X-Session-ID"] = request.session_id
+
     return StreamingResponse(
-        _chat_stream_generator(request, container),
+        _chat_stream_generator(request, container, current_user=current_user),
         media_type="text/event-stream",
-        headers=_STREAM_HEADERS,
+        headers=stream_headers,
     )
 
 
@@ -1116,6 +1270,7 @@ async def generate_chat_title(query: str) -> str:
 @router.post("/title", response_model=ChatTitleResponse)
 async def generate_title_endpoint(
     request: ChatTitleRequest,
+    current_user: CurrentUser,
     container: Container = Depends(get_container),
 ) -> ChatTitleResponse:
     """Fast, lightweight endpoint to generate a concise 2-5 word conversation title."""

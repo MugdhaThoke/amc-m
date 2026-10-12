@@ -53,7 +53,7 @@ class IntentClassifier:
         )
         try:
             result = await self._llm.complete_structured(
-                rendered, _INTENT_SCHEMA, system=prompt.system, fast=True,
+                rendered, _INTENT_SCHEMA, system=prompt.system, max_tokens=2500, fast=False,
             )
         except Exception as exc:
             logger.warning("Intent classification failed, falling back to general: %s", exc)

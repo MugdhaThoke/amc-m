@@ -104,11 +104,39 @@ class Synthesizer:
             else:
                 citations = [Citation(**c) for c in raw_citations]
 
+            from app.engine.cross_validation import extract_metric_provenances
+
+            docs_for_cv = [
+                {
+                    "name": src.document_title or src.document_id,
+                    "document_title": src.document_title or src.document_id,
+                    "page": getattr(src, "page_number", None) if getattr(src, "page_number", None) is not None else getattr(src, "page", None),
+                    "snippet": src.snippet,
+                    "full_text": getattr(src, "verbatim_text", "") or src.snippet,
+                }
+                for src in context.sources
+            ]
+            graph_triplets_for_cv = [
+                {
+                    "s": f.subject,
+                    "rel": f.predicate,
+                    "o": f.object,
+                    "properties": f.properties if hasattr(f, "properties") else {},
+                }
+                for f in getattr(context, "graph_facts", [])
+            ]
+            try:
+                metrics = extract_metric_provenances(raw_ans, docs_for_cv, graph_triplets_for_cv)
+            except Exception as cv_err:
+                logger.debug("Metric provenance extraction notice: %s", cv_err)
+                metrics = []
+
             return SynthesisOutput(
                 answer=raw_ans,
                 structured_rows=result.get("structured_rows", []),
                 compliance_note=result.get("compliance_note"),
                 citations=citations,
+                metrics=metrics,
                 provenance=provenance_items,
                 confidence=result.get("confidence",
                                       "high" if context.passed_quality_gate else "low"),
@@ -123,6 +151,7 @@ class Synthesizer:
                 structured_rows=[],
                 compliance_note="Synthesized via deterministic context retrieval (offline fallback).",
                 citations=[Citation(source_index=src.source_index, document_title=src.document_title or src.document_id) for src in context.sources[:3]],
+                metrics=[],
                 provenance=provenance_items,
                 confidence="medium" if context.passed_quality_gate else "low",
             )

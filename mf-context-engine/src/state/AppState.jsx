@@ -169,9 +169,14 @@ export function AppStateProvider({ children }) {
   const clearAuthSession = useCallback(() => {
     const sessionData = { isAuthenticated: false, authedUsername: null, token: null, expiresAt: null, rememberMe: false };
     setAuthSessionState(sessionData);
+    setChatSessionsState({});
+    const freshId = uuid();
+    setChatSessionIdState(freshId);
     try {
       sessionStorage.removeItem(STORAGE_KEYS.AUTH_SESSION);
       localStorage.removeItem(STORAGE_KEYS.AUTH_SESSION);
+      localStorage.removeItem(STORAGE_KEYS.CHAT_SESSIONS);
+      localStorage.removeItem(STORAGE_KEYS.ACTIVE_SESSION_ID);
     } catch {}
   }, []);
 
@@ -252,6 +257,15 @@ export function AppStateProvider({ children }) {
         } catch {}
 
         setActiveUsername(backendUser.username);
+
+        // Reset chat sessions state and assign fresh session ID for newly authenticated user
+        const freshSessionId = uuid();
+        setChatSessionIdState(freshSessionId);
+        setChatSessionsState({});
+        try {
+          localStorage.removeItem(STORAGE_KEYS.CHAT_SESSIONS);
+          localStorage.removeItem(STORAGE_KEYS.ACTIVE_SESSION_ID);
+        } catch {}
 
         setUsersState((prev) => {
           const profile = {
@@ -454,12 +468,12 @@ export function AppStateProvider({ children }) {
     safeStorageSet(STORAGE_KEYS.ACTIVE_SESSION_ID, id);
   }, []);
 
-  // Backend persistence helper
+  // Backend persistence helper with automatic conflict re-keying
   const saveSessionToBackend = useCallback(async (sessionId, sessionData) => {
     if (!sessionId || !sessionData) return;
     if (!hasUserMessage(sessionData)) return;
     try {
-      await apiSaveSession(sessionId, {
+      const resp = await apiSaveSession(sessionId, {
         session_id: sessionId,
         id: sessionId,
         title: sessionData.title,
@@ -467,43 +481,63 @@ export function AppStateProvider({ children }) {
         createdAt: sessionData.createdAt,
         updatedAt: sessionData.updatedAt,
       });
+
+      // If backend re-keyed the session due to ownership conflict, migrate state cleanly
+      if (resp?.rekeyed && resp?.session_id && resp.session_id !== sessionId) {
+        setChatSessionsState((prev) => {
+          const next = { ...prev };
+          const data = next[sessionId] || sessionData;
+          delete next[sessionId];
+          next[resp.session_id] = { ...data, id: resp.session_id };
+          safeStorageSet(STORAGE_KEYS.CHAT_SESSIONS, next);
+          return next;
+        });
+        setChatSessionIdState(resp.session_id);
+        safeStorageSet(STORAGE_KEYS.ACTIVE_SESSION_ID, resp.session_id);
+      }
     } catch (err) {
       console.warn(`Failed to persist session ${sessionId} to backend:`, err);
     }
   }, []);
 
-  // Synchronize chat sessions with backend on mount
+  // Synchronize chat sessions with backend on mount or when user changes
   useEffect(() => {
     let isCancelled = false;
     async function syncBackendSessions() {
+      if (!isAuthenticated || !authToken) return;
       try {
         const backendSessions = await apiFetchSessions();
-        if (isCancelled || !Array.isArray(backendSessions) || backendSessions.length === 0) return;
+        if (isCancelled || !Array.isArray(backendSessions)) return;
 
+        const validIds = new Set(backendSessions.map((bs) => bs.session_id));
         setChatSessionsState((prev) => {
-          const merged = { ...prev };
-          let changed = false;
+          const next = {};
+          // Only populate sessions that belong to the current authenticated user
           for (const bs of backendSessions) {
             const sid = bs.session_id;
             if (!sid) continue;
-            if (!merged[sid]) {
-              merged[sid] = {
-                id: sid,
-                title: bs.title || bs.preview || "Conversation",
-                isTitleGenerated: Boolean(bs.title && bs.title !== bs.preview),
-                history: [],
-                createdAt: bs.modified_time ? bs.modified_time * 1000 : Date.now(),
-                updatedAt: bs.modified_time ? bs.modified_time * 1000 : Date.now(),
-                _needsFetch: true,
-              };
-              changed = true;
-            }
+            next[sid] = prev[sid] || {
+              id: sid,
+              title: bs.title || bs.preview || "Conversation",
+              isTitleGenerated: Boolean(bs.title && bs.title !== bs.preview),
+              history: [],
+              createdAt: bs.modified_time ? bs.modified_time * 1000 : Date.now(),
+              updatedAt: bs.modified_time ? bs.modified_time * 1000 : Date.now(),
+              _needsFetch: true,
+            };
           }
-          if (changed) {
-            safeStorageSet(STORAGE_KEYS.CHAT_SESSIONS, merged);
-            return merged;
+          safeStorageSet(STORAGE_KEYS.CHAT_SESSIONS, next);
+          return next;
+        });
+
+        // Ensure active session belongs to this user; if not, point to their session or allocate a fresh uuid
+        setChatSessionIdState((currId) => {
+          if (!currId || !validIds.has(currId)) {
+            const chosen = backendSessions.length > 0 ? backendSessions[0].session_id : uuid();
+            safeStorageSet(STORAGE_KEYS.ACTIVE_SESSION_ID, chosen);
+            return chosen;
           }
-          return prev;
+          return currId;
         });
       } catch (err) {
         console.warn("Could not sync chat sessions from backend:", err);
@@ -513,10 +547,11 @@ export function AppStateProvider({ children }) {
     return () => {
       isCancelled = true;
     };
-  }, []);
+  }, [isAuthenticated, authToken, authedUsername]);
 
   // Fetch full history if the active session was loaded from backend metadata and needs history
   useEffect(() => {
+    if (!isAuthenticated || !authToken) return;
     if (chatSessions[chatSessionId]?._needsFetch) {
       apiFetchSessionHistory(chatSessionId)
         .then((data) => {
@@ -539,7 +574,7 @@ export function AppStateProvider({ children }) {
         })
         .catch((err) => console.warn("Could not load session history for active session:", err));
     }
-  }, [chatSessionId, chatSessions]);
+  }, [chatSessionId, chatSessions, isAuthenticated, authToken]);
 
   const getChatHistory = useCallback(
     (id = chatSessionId) => {
@@ -1257,8 +1292,9 @@ export function AppStateProvider({ children }) {
 
   const saveUserProfile = useCallback(
     async (profile) => {
+      let result = null;
       try {
-        await apiSaveUser(profile);
+        result = await apiSaveUser(profile);
       } catch (err) {
         console.warn("Backend user save failed, applying locally:", err);
       }
@@ -1266,20 +1302,27 @@ export function AppStateProvider({ children }) {
         const filtered = prev.filter((u) => u.username !== profile.username);
         return [...filtered, profile];
       });
+      return result;
     },
     [setUsers]
   );
 
   const deleteUserProfile = useCallback(
     async (username) => {
+      const current = (authedUsername || activeUsername || activeUser?.username || "").trim();
+      const normalize = (s) => (s || "").toLowerCase().replace(".", "_");
+      if (current && username && normalize(current) === normalize(username)) {
+        throw new Error("Administrators cannot delete their own account.");
+      }
       try {
         await apiDeleteUser(username);
       } catch (err) {
-        console.warn("Backend user delete failed, applying locally:", err);
+        console.warn("Backend user delete failed:", err);
+        throw err;
       }
       setUsers((prev) => prev.filter((u) => u.username !== username));
     },
-    [setUsers]
+    [setUsers, authedUsername, activeUsername, activeUser]
   );
 
   // ── 7. System & Cache State ────────────────────────────────────────────────

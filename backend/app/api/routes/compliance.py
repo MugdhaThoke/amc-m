@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from pydantic import BaseModel, Field
 
 
-from app.api.deps import Container, get_container
+from app.api.deps import Container, get_container, OptionalCurrentUser
 from app.compliance.audit_integration import log_resolution_audit, store_agent_metrics
 from app.compliance.escalation_engine import EscalationEngine
 from app.compliance.security import get_client_role, limit_requests, require_roles
@@ -61,6 +61,12 @@ _SCORECARD_CACHE: Dict[str, Dict[str, Any]] = {}
 _SCORECARD_CACHE_TTL_SEC = 60.0
 
 
+def _scorecard_cache_key(region: str, current_user: Optional[Any] = None) -> str:
+    user_id = current_user.username if current_user else "shared"
+    tenant_id = current_user.tenant_id if (current_user and current_user.tenant_id) else "default"
+    return f"{tenant_id}:{user_id}:{region}"
+
+
 class MultiAgentAuditRequest(BaseModel):
     fund_id: str = Field(..., pattern="^[A-Za-z0-9_\\-]+$", description="Fund ID must be alphanumeric")
     fund_data: Optional[Dict[str, Any]] = None
@@ -72,6 +78,7 @@ class MultiAgentAuditRequest(BaseModel):
 async def run_compliance_audit(
     request: Request,
     region: RegionEnum = Query(RegionEnum.SEBI, description="Regulatory jurisdiction: SEBI, SEC, ESMA"),
+    current_user: OptionalCurrentUser = None,
     container: Container = Depends(get_container),
 ):
     """Trigger automated compliance audit across all registered funds in region."""
@@ -83,6 +90,7 @@ async def run_compliance_audit(
     result = await detector.audit_all_funds(region=region.value)
 
     # Invalidate cached scorecard for region upon new audit
+    _SCORECARD_CACHE.pop(_scorecard_cache_key(region.value, current_user), None)
     _SCORECARD_CACHE.pop(region.value, None)
 
     return ComplianceAuditResultResponse(
@@ -237,11 +245,13 @@ async def resolve_violation(
 async def get_compliance_scorecard(
     request: Request,
     region: RegionEnum = Query(RegionEnum.SEBI),
+    current_user: OptionalCurrentUser = None,
     container: Container = Depends(get_container),
 ):
     """Get real-time AMC compliance scorecard with 60-second in-memory caching for <500ms SLA."""
     now_ts = time.time()
-    cache_entry = _SCORECARD_CACHE.get(region.value)
+    cache_key = _scorecard_cache_key(region.value, current_user)
+    cache_entry = _SCORECARD_CACHE.get(cache_key) or _SCORECARD_CACHE.get(region.value)
     if cache_entry and (now_ts - cache_entry["cached_at"]) < _SCORECARD_CACHE_TTL_SEC:
         scorecard = cache_entry["payload"]
     else:
@@ -251,7 +261,7 @@ async def get_compliance_scorecard(
             detector = ViolationDetector(container.graph, getattr(container, "rules_engine", None))
 
         scorecard = await detector.get_compliance_scorecard(region=region.value)
-        _SCORECARD_CACHE[region.value] = {"cached_at": now_ts, "payload": scorecard}
+        _SCORECARD_CACHE[cache_key] = {"cached_at": now_ts, "payload": scorecard}
 
     return ComplianceScorecard(
         overall_compliance_score=scorecard["overall_compliance_score"],

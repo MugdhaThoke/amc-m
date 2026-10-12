@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import DataFrame from "../../components/widgets/DataFrame";
 import Divider from "../../components/widgets/Divider";
@@ -10,21 +10,38 @@ import { AMCRole } from "../../data/rbac";
 import { useAppState } from "../../state/AppState";
 
 export default function AdminUsersTab() {
-  const { users, saveUserProfile, deleteUserProfile } = useAppState();
+  const { users, saveUserProfile, deleteUserProfile, activeUser, activeUsername, authedUsername } = useAppState();
+
+  const currentAdmin = (authedUsername || activeUsername || activeUser?.username || "").trim();
+  const normalize = (s) => (s || "").trim().toLowerCase().replace(".", "_");
+  const isSelf = (uname) => {
+    if (!currentAdmin || !uname) return false;
+    return normalize(uname) === normalize(currentAdmin);
+  };
 
   const [username, setUsername] = useState("");
   const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [role, setRole] = useState(Object.values(AMCRole)[0]);
   const [department, setDepartment] = useState("");
+  const [password, setPassword] = useState("");
   const [formMsg, setFormMsg] = useState(null);
 
-  const [delUser, setDelUser] = useState(
-    users.find((u) => u.username !== "sarah_compliance")?.username || ""
+  // Filter out system-protected default users AND the currently logged in administrator's account
+  const removableUsers = users.filter(
+    (u) => !isSelf(u.username) && u.username !== "sarah_compliance"
   );
+
+  const [delUser, setDelUser] = useState(removableUsers[0]?.username || "");
   const [delMsg, setDelMsg] = useState(null);
 
-  const removableUsers = users.filter((u) => u.username !== "sarah_compliance");
+  useEffect(() => {
+    if (removableUsers.length > 0 && !removableUsers.some((u) => u.username === delUser)) {
+      setDelUser(removableUsers[0]?.username || "");
+    } else if (removableUsers.length === 0 && delUser) {
+      setDelUser("");
+    }
+  }, [removableUsers, delUser]);
 
   const handleSave = async () => {
     if (username && fullName) {
@@ -35,12 +52,24 @@ export default function AdminUsersTab() {
         department: department.trim() || "General",
         email: email.trim() || `${username.trim().toLowerCase()}@amc.com`,
         status: "Active",
+        password: password.trim() || undefined,
       };
 
-      await saveUserProfile(userPayload);
-
-      setFormMsg({ type: "success", text: `User profile '${username}' (${role}) successfully created/updated!` });
-      setUsername(""); setFullName(""); setEmail(""); setDepartment("");
+      try {
+        const resp = await saveUserProfile(userPayload);
+        const assignedPwd = resp?.assigned_password || password.trim() || "Welcome@2026";
+        setFormMsg({
+          type: "success",
+          text: `User profile '${username.trim().toLowerCase()}' successfully saved! Login password: '${assignedPwd}'. The user can now log in using these credentials.`,
+        });
+        setUsername("");
+        setFullName("");
+        setEmail("");
+        setDepartment("");
+        setPassword("");
+      } catch (err) {
+        setFormMsg({ type: "error", text: err?.message || "Failed to save user profile." });
+      }
     } else {
       setFormMsg({ type: "error", text: "Please fill in both Username and Full Name." });
     }
@@ -48,8 +77,16 @@ export default function AdminUsersTab() {
 
   const handleDelete = async () => {
     if (!delUser) return;
-    await deleteUserProfile(delUser);
-    setDelMsg(`User profile '${delUser}' removed.`);
+    if (isSelf(delUser)) {
+      setDelMsg({ type: "error", text: "Administrators cannot delete their own account." });
+      return;
+    }
+    try {
+      await deleteUserProfile(delUser);
+      setDelMsg({ type: "success", text: `User profile '${delUser}' removed.` });
+    } catch (err) {
+      setDelMsg({ type: "error", text: err?.message || `Failed to remove user '${delUser}'.` });
+    }
   };
 
   return (
@@ -83,6 +120,14 @@ export default function AdminUsersTab() {
             />
             <div style={{ height: 10 }} />
             <TextInput label="Department / Unit" value={department} onChange={setDepartment} placeholder="e.g. Legal & Compliance" />
+            <div style={{ height: 10 }} />
+            <TextInput
+              label="Account Password"
+              type="password"
+              value={password}
+              onChange={setPassword}
+              placeholder="Leave blank for default: Welcome@2026"
+            />
           </div>
         </div>
         <div style={{ marginTop: 12, maxWidth: 220 }}>
@@ -100,18 +145,40 @@ export default function AdminUsersTab() {
         <Trash2 size={16} strokeWidth={1.75} style={{ marginRight: 6, verticalAlign: "-3px" }} />
         Remove User Profile
       </h3>
-      <Selectbox
-        label="Select User to Remove"
-        options={removableUsers.map((u) => u.username)}
-        value={delUser}
-        onChange={setDelUser}
-      />
-      <div style={{ marginTop: 10, maxWidth: 220 }}>
-        <Button kind="danger" fullWidth onClick={handleDelete}>Delete Selected Profile</Button>
-      </div>
+      {currentAdmin && (
+        <div style={{ fontSize: "0.82rem", color: "var(--text-muted, #64748b)", marginBottom: 10 }}>
+          Self-deletion protection: Your active account (<strong>{currentAdmin}</strong>) cannot be deleted.
+        </div>
+      )}
+      {removableUsers.length > 0 ? (
+        <>
+          <Selectbox
+            label="Select User to Remove"
+            options={removableUsers.map((u) => u.username)}
+            value={delUser}
+            onChange={setDelUser}
+          />
+          <div style={{ marginTop: 10, maxWidth: 220 }}>
+            <Button
+              kind="danger"
+              fullWidth
+              onClick={handleDelete}
+              disabled={!delUser || isSelf(delUser)}
+            >
+              Delete Selected Profile
+            </Button>
+          </div>
+        </>
+      ) : (
+        <div style={{ padding: "12px 14px", backgroundColor: "rgba(100, 116, 139, 0.08)", borderRadius: 6, fontSize: "0.88rem", color: "var(--text-muted, #64748b)" }}>
+          No other user profiles are eligible for removal.
+        </div>
+      )}
       {delMsg && (
         <div style={{ marginTop: 10 }}>
-          <Alert type="success">{delMsg}</Alert>
+          <Alert type={typeof delMsg === "object" ? delMsg.type : "success"}>
+            {typeof delMsg === "object" ? delMsg.text : delMsg}
+          </Alert>
         </div>
       )}
     </div>

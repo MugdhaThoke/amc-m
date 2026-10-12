@@ -23,11 +23,25 @@ class SemanticCache:
         self._cache = UnifiedSemanticCache(sim_threshold=threshold)
         self.threshold = threshold
 
-    def check(self, query: str) -> Tuple[Optional[dict], float]:
-        return self._cache.check(query)
+    def check(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> Tuple[Optional[dict], float]:
+        return self._cache.check(query, user_id=user_id, tenant_id=tenant_id)
 
-    def store(self, query: str, payload: dict):
-        self._cache.store(query, payload)
+    def store(
+        self,
+        query: str,
+        payload: dict,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ):
+        self._cache.store(query, payload, user_id=user_id, tenant_id=tenant_id)
+
+    def invalidate_user(self, user_id: str, tenant_id: Optional[str] = None) -> int:
+        return self._cache.invalidate_user(user_id, tenant_id)
 
     def clear(self):
         self._cache.clear()
@@ -39,3 +53,4 @@ class SemanticCache:
 def get_cache() -> UnifiedSemanticCache:
     """Returns the process-wide canonical semantic cache instance."""
     return get_semantic_cache()
+

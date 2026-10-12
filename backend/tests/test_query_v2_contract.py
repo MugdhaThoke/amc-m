@@ -54,7 +54,18 @@ def app():
     container.graph = mock_g
     container.orchestrator._traversal._graph = mock_g
     
-    return create_app()
+    app_instance = create_app()
+    app_instance.dependency_overrides[deps.get_current_user] = lambda: deps.AuthenticatedUser(
+        username="vikram.pm",
+        display_name="Vikram Mehta",
+        role="Fund Manager / Portfolio Manager",
+        department="Equity Investment Management",
+        email="v.mehta@amc.com",
+        avatar_initials="VM",
+        status="Active",
+        tenant_id=None,
+    )
+    return app_instance
 
 
 
@@ -109,7 +120,7 @@ async def test_query_v2_and_chat_v2_endpoints(app):
         # Test /api/chat/v2
         chat_payload = {
             "query": "How do those rules classify large cap schemes?",
-            "session_id": "test_session_001",
+            "session_id": "vikram_contract_session_001",
             "history": [
                 {"role": "user", "content": "What are the equity scheme categorization rules under SEBI 2017 circular?"},
                 {"role": "assistant", "content": "SEBI 2017 mandates specific definitions for large cap, mid cap, and small cap equity schemes."},
@@ -121,7 +132,7 @@ async def test_query_v2_and_chat_v2_endpoints(app):
         assert chat_resp.headers.get("x-serving-engine") == "v2"
         chat_data = chat_resp.json()
         assert chat_data["serving_engine"] == "v2"
-        assert chat_data["session_id"] == "test_session_001"
+        assert chat_data["session_id"] == "vikram_contract_session_001"
         assert chat_data["turn_index"] == 2
         assert "trace" in chat_data
 

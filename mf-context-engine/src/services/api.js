@@ -4,12 +4,42 @@
 
 export const API_BASE = "/api";
 
+export function getAuthHeaders() {
+  const headers = {};
+  if (typeof window !== "undefined") {
+    try {
+      const stored = sessionStorage.getItem("ns_cg_auth_session_v1") || localStorage.getItem("ns_cg_auth_session_v1");
+      if (stored) {
+        const session = JSON.parse(stored);
+        if (session?.token) {
+          headers["Authorization"] = `Bearer ${session.token}`;
+        }
+        if (session?.authedUsername) {
+          headers["X-User-ID"] = session.authedUsername;
+        }
+      }
+    } catch {}
+
+    if (!headers["X-User-ID"]) {
+      try {
+        const activeUser = sessionStorage.getItem("ns_cg_active_user_v1") || localStorage.getItem("ns_cg_active_user_v1");
+        if (activeUser) {
+          headers["X-User-ID"] = JSON.parse(activeUser);
+        }
+      } catch {}
+    }
+  }
+  return headers;
+}
+
 async function request(endpoint, options = {}) {
   const url = endpoint.startsWith("http")
     ? endpoint
     : `${API_BASE}${endpoint.startsWith("/") ? "" : "/"}${endpoint}`;
+  const authHeaders = getAuthHeaders();
   const headers = {
     "Content-Type": "application/json",
+    ...authHeaders,
     ...(options.headers || {}),
   };
 
@@ -270,6 +300,12 @@ export function adaptHybridResponse(hybridData, latencyMs = 0) {
       ? synthesis.metrics
       : (Array.isArray(hybridData.metrics) && hybridData.metrics.length > 0)
       ? hybridData.metrics
+      : (Array.isArray(hybridData.graph_highlight?.metrics) && hybridData.graph_highlight.metrics.length > 0)
+      ? hybridData.graph_highlight.metrics
+      : (Array.isArray(hybridData.telemetry_breakdown?.cross_validation_ledger?.metrics) && hybridData.telemetry_breakdown.cross_validation_ledger.metrics.length > 0)
+      ? hybridData.telemetry_breakdown.cross_validation_ledger.metrics
+      : (Array.isArray(hybridData.graph_highlight?.cross_val_ledger?.metrics) && hybridData.graph_highlight.cross_val_ledger.metrics.length > 0)
+      ? hybridData.graph_highlight.cross_val_ledger.metrics
       : [];
 
   const provenance = citations.map((c) => ({
@@ -408,9 +444,13 @@ export async function generateChatTitle({ query, session_id }) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 2500);
 
+    const authHeaders = getAuthHeaders();
     const res = await fetch(`${API_BASE}/chat/title`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders,
+      },
       body: JSON.stringify({ query: query.trim(), session_id }),
       signal: controller.signal,
     });
@@ -563,9 +603,10 @@ export async function fetchFeedback(responseId) {
  */
 export async function detectStreamingSupport() {
   try {
+    const authHeaders = getAuthHeaders();
     const response = await fetch(`${API_BASE}/query/health/stream-test`, {
       method: "GET",
-      headers: { Accept: "text/event-stream" },
+      headers: { Accept: "text/event-stream", ...authHeaders },
     });
     return response.headers.get("Content-Type")?.includes("event-stream") ?? false;
   } catch {
@@ -717,15 +758,22 @@ export async function sendQueryStream({
     }
 
     try {
+      const authHeaders = getAuthHeaders();
       const response = await fetch(`${API_BASE}/query/stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...authHeaders,
+        },
         body: JSON.stringify({ query, mode, top_k }),
         signal,
       });
 
       if (!response.ok) {
-        throw new Error(`Stream failed: ${response.status}`);
+        const errorText = await response.text().catch(() => "");
+        const errObj = new Error(`Stream failed: ${response.status} ${errorText}`);
+        errObj.status = response.status;
+        throw errObj;
       }
 
       await _parseSSEStream(response, { onChunk, onMetadata, onSources, onError, onComplete }, metrics, signal);
@@ -733,6 +781,10 @@ export async function sendQueryStream({
     } catch (err) {
       if (signal?.aborted || err.name === "AbortError") {
         // User aborted via stop button — not an error
+        return;
+      }
+      if (err.status && err.status >= 400 && err.status < 500) {
+        onError?.({ type: "error", message: err.message, status: err.status, recoverable: false });
         return;
       }
       if (attempt >= BACKOFF_DELAYS.length) {
@@ -798,9 +850,13 @@ export async function sendChatStream({
     }
 
     try {
+      const authHeaders = getAuthHeaders();
       const response = await fetch(`${API_BASE}/chat/stream`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...authHeaders,
+        },
         body: JSON.stringify({
           query,
           history: cleanHistory,
@@ -811,13 +867,20 @@ export async function sendChatStream({
       });
 
       if (!response.ok) {
-        throw new Error(`Chat stream failed: ${response.status}`);
+        const errorText = await response.text().catch(() => "");
+        const errObj = new Error(`Chat stream failed: ${response.status} ${errorText}`);
+        errObj.status = response.status;
+        throw errObj;
       }
 
       await _parseSSEStream(response, { onChunk, onMetadata, onSources, onError, onComplete }, metrics, signal);
       return; // Success
     } catch (err) {
       if (signal?.aborted || err.name === "AbortError") return;
+      if (err.status && err.status >= 400 && err.status < 500) {
+        onError?.({ type: "error", message: err.message, status: err.status, recoverable: false });
+        return;
+      }
       if (attempt >= BACKOFF_DELAYS.length) {
         onError?.({ type: "error", message: err.message, recoverable: false });
         return;

@@ -19,11 +19,43 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.api.deps import get_current_user
 from app.api.routes import sessions as sessions_route
+from app.auth.service import AuthenticatedUser
+from app.core.database import SessionLocal
+from app.schemas.chat_sessions_table import ChatSession
 
 # Build test app with sessions router
 test_app = FastAPI()
+test_app.dependency_overrides[get_current_user] = lambda: AuthenticatedUser(
+    username="sarah.compliance",
+    display_name="Sarah Kapoor",
+    role="Compliance & Regulatory Officer",
+    department="Regulatory & Legal Compliance",
+    email="s.kapoor@amc.com",
+    avatar_initials="SK",
+    status="Active",
+    tenant_id=None,
+)
 test_app.include_router(sessions_route.router, prefix="/api")
+
+
+def _register_session(session_id: str, user_id: str = "sarah.compliance", created_at: str = "2026-10-12T10:00:00Z"):
+    """Helper to insert/update a session in the database."""
+    with SessionLocal() as db:
+        existing = db.query(ChatSession).filter_by(session_id=session_id).first()
+        if existing:
+            existing.user_id = user_id
+            existing.created_at = created_at
+            existing.updated_at = created_at
+        else:
+            db.add(ChatSession(
+                session_id=session_id,
+                user_id=user_id,
+                created_at=created_at,
+                updated_at=created_at,
+            ))
+        db.commit()
 
 
 @pytest.fixture
@@ -34,6 +66,26 @@ def temp_sessions_dir(monkeypatch):
     yield temp_dir
     if temp_dir.exists():
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def cleanup_test_sessions():
+    """Clean up test sessions from database after each test."""
+    yield
+    test_ids = [
+        "test-session-uuid-1234",
+        "sess-1", "sess-2", "corrupt",
+        "sess-to-delete",
+        "blank-session", "asst-only", "whitespace-user", "valid-chat",
+        "empty-attempt",
+        "chat-1", "chat-2", "chat-3", "chat-4",
+    ]
+    with SessionLocal() as db:
+        for sid in test_ids:
+            row = db.query(ChatSession).filter_by(session_id=sid).first()
+            if row:
+                db.delete(row)
+        db.commit()
 
 
 def test_list_sessions_empty(temp_sessions_dir):
@@ -57,7 +109,8 @@ def test_save_and_get_session(temp_sessions_dir):
     # Save session
     save_resp = client.post(f"/api/sessions/{session_id}", json=payload)
     assert save_resp.status_code == 200
-    assert save_resp.json() == {"status": "ok", "session_id": session_id}
+    assert save_resp.json()["status"] == "ok"
+    assert save_resp.json()["session_id"] == session_id
 
     # Verify file exists on disk with 2-space indentation and UTF-8
     file_path = temp_sessions_dir / f"{session_id}.json"
@@ -83,6 +136,7 @@ def test_list_sessions_preview_and_sorting(temp_sessions_dir):
         {"role": "assistant", "content": "Short answer"}
     ]), encoding="utf-8")
     os.utime(s1, (1000, 1000))
+    _register_session("sess-1", created_at="2026-10-12T10:00:00Z")
 
     # Create session 2 with long query (> 45 chars)
     s2 = temp_sessions_dir / "sess-2.json"
@@ -91,10 +145,12 @@ def test_list_sessions_preview_and_sorting(temp_sessions_dir):
         {"role": "assistant", "content": "Here is the answer"}
     ]), encoding="utf-8")
     os.utime(s2, (2000, 2000))
+    _register_session("sess-2", created_at="2026-10-12T11:00:00Z")
 
     # Create corrupt file
     corrupt = temp_sessions_dir / "corrupt.json"
     corrupt.write_text("invalid json content {{{", encoding="utf-8")
+    _register_session("corrupt", created_at="2026-10-12T12:00:00Z")
 
     list_resp = client.get("/api/sessions")
     assert list_resp.status_code == 200
@@ -119,16 +175,16 @@ def test_delete_session(temp_sessions_dir):
     session_id = "sess-to-delete"
     path = temp_sessions_dir / f"{session_id}.json"
     path.write_text(json.dumps({"session_id": session_id, "history": []}), encoding="utf-8")
+    _register_session(session_id)
 
     del_resp = client.delete(f"/api/sessions/{session_id}")
     assert del_resp.status_code == 200
     assert del_resp.json() == {"status": "deleted", "session_id": session_id}
     assert not path.exists()
 
-    # Delete non-existent
+    # Delete non-existent: in Phase 2 returns 404 to avoid leaking session existence
     del_resp2 = client.delete(f"/api/sessions/{session_id}")
-    assert del_resp2.status_code == 200
-    assert del_resp2.json() == {"status": "not_found", "session_id": session_id}
+    assert del_resp2.status_code == 404
 
 
 def test_list_sessions_skips_empty_conversations(temp_sessions_dir):
@@ -138,6 +194,7 @@ def test_list_sessions_skips_empty_conversations(temp_sessions_dir):
     # 1. Blank session file (empty history)
     blank = temp_sessions_dir / "blank-session.json"
     blank.write_text(json.dumps({"session_id": "blank-session", "history": []}), encoding="utf-8")
+    _register_session("blank-session")
 
     # 2. Assistant-only messages (no user message)
     asst_only = temp_sessions_dir / "asst-only.json"
@@ -145,6 +202,7 @@ def test_list_sessions_skips_empty_conversations(temp_sessions_dir):
         "session_id": "asst-only",
         "history": [{"role": "assistant", "content": "How can I help you today?"}]
     }), encoding="utf-8")
+    _register_session("asst-only")
 
     # 3. Whitespace-only user message
     whitespace = temp_sessions_dir / "whitespace-user.json"
@@ -152,6 +210,7 @@ def test_list_sessions_skips_empty_conversations(temp_sessions_dir):
         "session_id": "whitespace-user",
         "history": [{"role": "user", "content": "   "}]
     }), encoding="utf-8")
+    _register_session("whitespace-user")
 
     # 4. Valid session with actual user query
     valid = temp_sessions_dir / "valid-chat.json"
@@ -163,6 +222,7 @@ def test_list_sessions_skips_empty_conversations(temp_sessions_dir):
             {"role": "assistant", "content": "The limits are defined in Circular 3."}
         ]
     }), encoding="utf-8")
+    _register_session("valid-chat")
 
     resp = client.get("/api/sessions")
     assert resp.status_code == 200
@@ -202,20 +262,20 @@ def test_delete_reflow_chats_without_gaps_or_stale_entries(temp_sessions_dir):
 
     # Create Chat 1 (oldest) to Chat 4 (newest)
     chat_configs = [
-        ("chat-1", "Chat 1 Query", 1000),
-        ("chat-2", "Chat 2 Query", 2000),
-        ("chat-3", "Chat 3 Query", 3000),
-        ("chat-4", "Chat 4 Query", 4000),
+        ("chat-1", "Chat 1 Query", "2026-10-12T01:00:00Z"),
+        ("chat-2", "Chat 2 Query", "2026-10-12T02:00:00Z"),
+        ("chat-3", "Chat 3 Query", "2026-10-12T03:00:00Z"),
+        ("chat-4", "Chat 4 Query", "2026-10-12T04:00:00Z"),
     ]
 
-    for sid, query, mtime in chat_configs:
+    for sid, query, created_at in chat_configs:
         file = temp_sessions_dir / f"{sid}.json"
         file.write_text(json.dumps({
             "session_id": sid,
             "title": f"Title for {sid}",
             "history": [{"role": "user", "content": query}]
         }), encoding="utf-8")
-        os.utime(file, (mtime, mtime))
+        _register_session(sid, created_at=created_at)
 
     # Initial list: [chat-4, chat-3, chat-2, chat-1]
     list1 = client.get("/api/sessions").json()

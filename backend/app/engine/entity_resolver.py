@@ -31,8 +31,21 @@ _candidate_cache: dict[str, tuple[float, list[dict]]] = {}
 _CACHE_TTL = 86400  # seconds — candidate pool refreshes every 24 hours, not every 5 min
 
 
-def _cache_key(product_names: frozenset | None) -> str:
-    return "|".join(sorted(product_names)) if product_names else "__all__"
+def _cache_key(
+    product_names: frozenset | None,
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> str:
+    prods_str = "|".join(sorted(product_names)) if product_names else "__all__"
+    if user_id:
+        from app.core.cache_utils import generate_cache_key
+        return generate_cache_key(
+            namespace="entity_resolve",
+            key_components={"products": prods_str},
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+    return prods_str
 
 
 _embedding_cache: dict[str, Any] = {}  # candidate text -> vector, persists across calls
@@ -47,8 +60,18 @@ def clear_resolver_cache():
     _query_vec_cache.clear()
 
 
-def _get_candidates(product_names: set | None = None) -> list[dict]:
-    key = _cache_key(frozenset(product_names) if product_names else None)
+def invalidate_user_resolver_cache(user_id: str, tenant_id: Optional[str] = None) -> int:
+    """Invalidate entity candidate cache entries for a specific user."""
+    from app.core.cache_utils import invalidate_user_cache
+    return invalidate_user_cache(_candidate_cache, "entity_resolve", user_id, tenant_id)
+
+
+def _get_candidates(
+    product_names: set | None = None,
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> list[dict]:
+    key = _cache_key(frozenset(product_names) if product_names else None, user_id=user_id, tenant_id=tenant_id)
     now = time.time()
     if key in _candidate_cache:
         ts, cached = _candidate_cache[key]
@@ -63,13 +86,18 @@ def _get_candidates(product_names: set | None = None) -> list[dict]:
 
 
 
-def resolve_entities_for_query(entity_texts: list[str], product_names: set | None = None,
-                                threshold: float = None) -> dict[str, list[str]]:
+def resolve_entities_for_query(
+    entity_texts: list[str],
+    product_names: set | None = None,
+    threshold: float = None,
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> dict[str, list[str]]:
     threshold = threshold if threshold is not None else config.SIMILARITY_MATCH_THRESHOLD
     if not entity_texts:
         return {}
 
-    candidates = _get_candidates(product_names)
+    candidates = _get_candidates(product_names, user_id=user_id, tenant_id=tenant_id)
     if not candidates:
         return {t: [] for t in entity_texts}
 

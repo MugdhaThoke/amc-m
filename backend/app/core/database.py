@@ -41,6 +41,13 @@ def init_db():
 
     Base.metadata.create_all(bind=engine)
     try:
+        from scripts.migrate_user_ownership import run_migration
+        run_migration(BASE_DIR / "data.db")
+    except Exception as e:
+        import logging
+        logging.getLogger("app.core.database").warning("Failed to run user ownership migration: %s", e)
+
+    try:
         from app.db.migrate_data import populate_data_db
         populate_data_db()
     except Exception as e:

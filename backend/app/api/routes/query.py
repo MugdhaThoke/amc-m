@@ -27,7 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from app.api.deps import Container, get_container
+from app.api.deps import Container, get_container, OptionalCurrentUser
 from app.api.routes.files import get_pdf_url
 from app.core.database import get_db
 from app.engine import config as engine_config
@@ -216,10 +216,19 @@ def _contextgraph_response(
 
 # ---------- endpoints ----------
 
-async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> QueryResponse:
+async def _run_v2_orchestrator(
+    request: QueryRequest,
+    container: Container,
+    current_user: Optional[Any] = None,
+) -> QueryResponse:
     query = request.query
     mode = request.mode
-    resp_obj = await container.orchestrator.answer(query, top_k=request.top_k)
+    resp_obj = await container.orchestrator.answer(
+        query,
+        top_k=request.top_k,
+        user_id=current_user.username if current_user else None,
+        tenant_id=current_user.tenant_id if current_user else None,
+    )
     intent = resp_obj.intent
     retrieval_res = resp_obj.retrieval
     context = resp_obj.context
@@ -419,11 +428,49 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
         for f in graph_facts
     ]
 
-    cross_val_ledger = {
-        "cross_validation_badge": {"label": "Pillar 5: Verified Grounding", "type": "success", "desc": "Grounded against active corpus."},
-        "evidence_status": "SUPPORTED",
-        "metrics": [],
-    }
+    # Cross-validate answer against retrieved documents and graph facts
+    ans_text_for_cv = synthesis.answer if synthesis else ""
+    docs_for_cv = []
+    for i, s in enumerate(sources):
+        if isinstance(s, dict):
+            d_name = s.get("document_title") or s.get("name") or s.get("document_id") or f"Doc {i+1}"
+            d_page = s.get("page_number") if s.get("page_number") is not None else s.get("page")
+            d_snippet = s.get("snippet", "")
+            d_text = s.get("verbatim_text") or s.get("full_text") or s.get("snippet", "")
+        else:
+            d_name = getattr(s, "document_title", None) or getattr(s, "document_id", None) or getattr(s, "name", None) or f"Doc {i+1}"
+            d_page = getattr(s, "page_number", None) if getattr(s, "page_number", None) is not None else getattr(s, "page", None)
+            d_snippet = getattr(s, "snippet", "") or ""
+            d_text = getattr(s, "verbatim_text", "") or getattr(s, "full_text", "") or getattr(s, "snippet", "") or ""
+        docs_for_cv.append({
+            "name": d_name,
+            "document_title": d_name,
+            "page": d_page,
+            "snippet": d_snippet,
+            "full_text": d_text,
+        })
+    try:
+        from app.engine.cross_validation import cross_validate_answer
+        cv_report = cross_validate_answer(
+            query=query,
+            answer=ans_text_for_cv,
+            retrieved_docs=docs_for_cv,
+            graph_triplets=triplet_table,
+            query_type=intent.query_type.value if intent else "v2",
+        )
+        cross_val_ledger = cv_report
+        metrics_list = cv_report.get("metrics", [])
+    except Exception as cv_exc:
+        logger.warning("Cross-validation failed in _run_v2_orchestrator: %s", cv_exc)
+        cross_val_ledger = {
+            "cross_validation_badge": {"label": "Pillar 5: Verified Grounding", "type": "success", "desc": "Grounded against active corpus."},
+            "evidence_status": "SUPPORTED",
+            "metrics": getattr(synthesis, "metrics", []) if synthesis else [],
+        }
+        metrics_list = cross_val_ledger["metrics"]
+
+    if synthesis:
+        synthesis.metrics = metrics_list
 
     # Token totals
     total_tokens = (trace.input_tokens + trace.output_tokens) if trace else 0
@@ -505,6 +552,8 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
             "total_tokens": total_tokens,
             "telemetry_breakdown": telemetry_breakdown,
             "provenance": provenance_list,
+            "metrics": metrics_list,
+            "cross_val_ledger": cross_val_ledger,
             "pending_feedback_notice": pending_feedback_notice.model_dump() if pending_feedback_notice else None,
         },
         context_debug=context,
@@ -524,9 +573,10 @@ async def run_query_v2(
     request: QueryRequest,
     response: Response,
     container: Container = Depends(get_container),
+    current_user: OptionalCurrentUser = None,
 ) -> QueryResponse:
     """Explicit v2 ContextGraph orchestrator endpoint."""
-    resp = await _run_v2_orchestrator(request, container)
+    resp = await _run_v2_orchestrator(request, container, current_user=current_user)
     response.headers["X-Serving-Engine"] = resp.serving_engine or "v2"
     return resp
 
@@ -695,7 +745,11 @@ def _format_sse(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
-async def _query_stream_generator(request: QueryRequest, container: Container):
+async def _query_stream_generator(
+    request: QueryRequest,
+    container: Container,
+    current_user: Optional[Any] = None,
+):
     """Async generator that drives the orchestrator stream and formats SSE frames.
 
     Handles:
@@ -720,6 +774,8 @@ async def _query_stream_generator(request: QueryRequest, container: Container):
         async for event in container.orchestrator.answer_stream(
             query=request.query,
             top_k=request.top_k,
+            user_id=current_user.username if current_user else None,
+            tenant_id=current_user.tenant_id if current_user else None,
         ):
             event_type = event.get("type", "chunk")
             # Map internal type names → SSE event types
@@ -799,6 +855,7 @@ _STREAM_HEADERS = {
 async def query_stream(
     request: QueryRequest,
     container: Container = Depends(get_container),
+    current_user: OptionalCurrentUser = None,
 ) -> StreamingResponse:
     """Server-Sent Events streaming endpoint for /query.
 
@@ -810,7 +867,7 @@ async def query_stream(
       event: error    — recoverable/non-recoverable error notification
     """
     return StreamingResponse(
-        _query_stream_generator(request, container),
+        _query_stream_generator(request, container, current_user=current_user),
         media_type="text/event-stream",
         headers=_STREAM_HEADERS,
     )

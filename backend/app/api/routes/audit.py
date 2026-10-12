@@ -22,7 +22,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-
+from app.api.deps import CurrentUser
 from app.core.database import get_db
 from app.schemas.audit_metadata_table import AuditMetadata
 from app.schemas.violations_table import Violation
@@ -150,19 +150,29 @@ def list_response_feedback(
 # ---------------------------------------------------------
 
 @router.post("/query-evidence", response_model=dict, status_code=status.HTTP_201_CREATED)
-def create_query_evidence(payload: QueryEvidenceCreate, db: Session = Depends(get_db)):
+def create_query_evidence(
+    payload: QueryEvidenceCreate,
+    current_user: CurrentUser,
+    db: Session = Depends(get_db),
+):
     data = payload.model_dump(exclude_none=True)
+    data["user_id"] = current_user.username
+    if current_user.tenant_id:
+        data["tenant_id"] = current_user.tenant_id
     row = _create_row(db, QueryEvidence, data)
     return _row_to_dict(row)
 
 
 @router.get("/query-evidence", response_model=List[dict])
 def list_query_evidence(
+    current_user: CurrentUser,
     session_id: str | None = Query(None),
     limit: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
-    q = db.query(QueryEvidence)
+    q = db.query(QueryEvidence).filter(QueryEvidence.user_id == current_user.username)
+    if current_user.tenant_id:
+        q = q.filter(QueryEvidence.tenant_id == current_user.tenant_id)
     if session_id:
         q = q.filter(QueryEvidence.session_id == session_id)
     rows = q.order_by(QueryEvidence.created_at.desc()).limit(limit).all()

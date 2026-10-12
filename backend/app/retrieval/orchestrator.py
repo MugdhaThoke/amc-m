@@ -143,6 +143,8 @@ class RetrievalOrchestrator:
         top_k: int,
         intent: QueryIntent,
         resolved_entities: list[BaseEntity],
+        user_id: str | None = None,
+        tenant_id: str | None = None,
     ) -> list[RetrievedChunk]:
         """Single taxonomy-scoped vector search."""
         hits = await self._vector.search(
@@ -150,6 +152,8 @@ class RetrievalOrchestrator:
             top_k=top_k,
             taxonomy_paths=intent.taxonomy_paths or None,
             entity_names=[e.name for e in resolved_entities] or None,
+            user_id=user_id,
+            tenant_id=tenant_id,
         )
         return self._hits_to_chunks(hits)
 
@@ -161,6 +165,8 @@ class RetrievalOrchestrator:
         top_k: int,
         intent: QueryIntent,
         resolved_entities: list[BaseEntity],
+        user_id: str | None = None,
+        tenant_id: str | None = None,
     ) -> list[RetrievedChunk]:
         """Executes the retrieval sub-tasks of an execution plan.
 
@@ -183,7 +189,10 @@ class RetrievalOrchestrator:
                         retrieval_tasks.append(sub_query.strip())
 
         if not retrieval_tasks:
-            return await self._search_chunks(search_query, top_k, intent, resolved_entities)
+            return await self._search_chunks(
+                search_query, top_k, intent, resolved_entities,
+                user_id=user_id, tenant_id=tenant_id,
+            )
 
         # Branch queries keep the HyDE augmentation so both paths embed alike.
         branch_queries = [
@@ -195,7 +204,10 @@ class RetrievalOrchestrator:
 
         results = await asyncio.gather(
             *[
-                self._search_chunks(bq, per_branch_k, intent, resolved_entities)
+                self._search_chunks(
+                    bq, per_branch_k, intent, resolved_entities,
+                    user_id=user_id, tenant_id=tenant_id,
+                )
                 for bq in branch_queries
             ],
             return_exceptions=True,
@@ -212,7 +224,10 @@ class RetrievalOrchestrator:
                     merged[chunk.chunk_id] = chunk
 
         if not merged:
-            return await self._search_chunks(search_query, top_k, intent, resolved_entities)
+            return await self._search_chunks(
+                search_query, top_k, intent, resolved_entities,
+                user_id=user_id, tenant_id=tenant_id,
+            )
 
         chunks = sorted(merged.values(), key=lambda c: c.score, reverse=True)[:top_k]
         logger.info(
@@ -328,6 +343,8 @@ class RetrievalOrchestrator:
         enable_hyde: bool = True,
         enable_decomposition: bool = True,
         track_metrics: bool = True,
+        user_id: str | None = None,
+        tenant_id: str | None = None,
     ) -> OrchestratorResponse:
         t0 = time.perf_counter()
         req_id = str(uuid4())
@@ -395,7 +412,7 @@ class RetrievalOrchestrator:
         cache = get_semantic_cache()
         cached_entry = None
         try:
-            cached_entry = cache.lookup(effective_query, corpus_version=self._corpus_version)
+            cached_entry = cache.lookup(effective_query, corpus_version=self._corpus_version, user_id=user_id, tenant_id=tenant_id)
         except Exception as exc:
             logger.debug("Cache lookup notice: %s", exc)
         t_cache_lookup_ms = (time.perf_counter() - t_cache_start) * 1000
@@ -560,6 +577,8 @@ class RetrievalOrchestrator:
                     # Corpus-wide aggregations ("total AUM of all schemes") resolve
                     # no entities, so they must be allowed to run unscoped.
                     allow_global_scope=bool(getattr(intent, "aggregation_type", "")),
+                    user_id=user_id,
+                    tenant_id=tenant_id,
                 )
                 if rows:
                     cypher_structured_rows.extend(rows)
@@ -590,7 +609,11 @@ class RetrievalOrchestrator:
         if enable_hyde and config.ENABLE_HYDE_IN_ORCHESTRATOR and config.ENABLE_HYDE_CACHE and intent.requires_vector:
             comp_hyde = ComponentMetric("hyde_expansion", time.perf_counter())
             try:
-                hyde_doc, hyde_latency = hyde.generate_hypothetical_document(effective_query)
+                hyde_doc, hyde_latency = hyde.generate_hypothetical_document(
+                    effective_query,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                )
                 comp_hyde.latency_ms = hyde_latency
                 comp_hyde.cache_hit = (hyde_latency < 5.0)
                 logger.info("HyDE document generated (%.1fms, cached=%s)", hyde_latency, hyde_latency < 5.0)
@@ -617,12 +640,16 @@ class RetrievalOrchestrator:
             comp_par = ComponentMetric("parallel_graph_and_vector", time.perf_counter())
 
             async def _do_graph():
-                return await self._traversal.traverse(intent, resolved_entities)
+                return await self._traversal.traverse(
+                    intent, resolved_entities,
+                    user_id=user_id, tenant_id=tenant_id,
+                )
 
             async def _do_vector():
                 return await self._execute_plan_retrieval(
                     plan, search_query, hyde_doc,
                     top_k or self._top_k, intent, resolved_entities,
+                    user_id=user_id, tenant_id=tenant_id,
                 )
 
             graph_res, vector_res = await asyncio.gather(_do_graph(), _do_vector(), return_exceptions=True)
@@ -647,7 +674,10 @@ class RetrievalOrchestrator:
             # Sequential execution path
             if intent.requires_graph and resolved_entities:
                 t_graph_start = time.perf_counter()
-                facts, traversal_paths, cyphers = await self._traversal.traverse(intent, resolved_entities)
+                facts, traversal_paths, cyphers = await self._traversal.traverse(
+                    intent, resolved_entities,
+                    user_id=user_id, tenant_id=tenant_id,
+                )
                 t_graph_ms = (time.perf_counter() - t_graph_start) * 1000
                 if metrics:
                     metrics.add_component(ComponentMetric("graph_traversal", latency_ms=t_graph_ms))
@@ -657,6 +687,7 @@ class RetrievalOrchestrator:
                 chunks = await self._execute_plan_retrieval(
                     plan, search_query, hyde_doc,
                     top_k or self._top_k, intent, resolved_entities,
+                    user_id=user_id, tenant_id=tenant_id,
                 )
                 t_vector_ms = (time.perf_counter() - t_vector_start) * 1000
                 if metrics:
@@ -699,6 +730,8 @@ class RetrievalOrchestrator:
                         resolved_entities=resolved_entities,
                         original_threshold=0.45,
                         relaxed_threshold=0.30,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
                     )
                     if round2_chunks:
                         chunks.extend(round2_chunks)
@@ -855,6 +888,8 @@ class RetrievalOrchestrator:
                     "structured_rows": synthesis.structured_rows,
                 },
                 corpus_version=self._corpus_version,
+                user_id=user_id,
+                tenant_id=tenant_id,
             )
         except Exception as exc:
             logger.debug("Cache store notice: %s", exc)
@@ -902,10 +937,21 @@ class RetrievalOrchestrator:
             metrics=metrics,
         )
 
-    async def traditional_search(self, query: str, top_k: int | None = None) -> list[dict]:
+    async def traditional_search(
+        self,
+        query: str,
+        top_k: int | None = None,
+        user_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> list[dict]:
         """Flat vector search with no graph, no taxonomy scoping, no synthesis —
         the 'traditional RAG' comparison baseline."""
-        hits = await self._vector.search(query, top_k=top_k or self._top_k)
+        hits = await self._vector.search(
+            query,
+            top_k=top_k or self._top_k,
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
         return hits
 
     async def answer_stream(
@@ -916,6 +962,8 @@ class RetrievalOrchestrator:
         session_id: str | None = None,
         enable_hyde: bool = True,
         track_metrics: bool = True,
+        user_id: str | None = None,
+        tenant_id: str | None = None,
     ) -> AsyncGenerator[dict, None]:
         """Stream the answer pipeline as SSE-shaped dicts."""
         t0 = time.perf_counter()
@@ -971,7 +1019,7 @@ class RetrievalOrchestrator:
         cache = get_semantic_cache()
         cached_entry = None
         try:
-            cached_entry = cache.lookup(effective_query, corpus_version=self._corpus_version)
+            cached_entry = cache.lookup(effective_query, corpus_version=self._corpus_version, user_id=user_id, tenant_id=tenant_id)
         except Exception as exc:
             logger.debug("Cache lookup notice: %s", exc)
 
@@ -1019,7 +1067,9 @@ class RetrievalOrchestrator:
                     "compliance_note": None,
                     "citations": cached_entry.get("citations", []),
                     "structured_rows": [],
+                    "metrics": cached_entry.get("metrics", []),
                 },
+                "metrics": cached_entry.get("metrics", []),
                 "graph_facts": cached_entry.get("graph_facts", []),
                 "graph_nodes": sorted({f.get("subject") if isinstance(f, dict) else getattr(f, "subject", "") for f in cached_entry.get("graph_facts", [])} | {f.get("object") if isinstance(f, dict) else getattr(f, "object", "") for f in cached_entry.get("graph_facts", [])}),
                 "graph_relationships": sorted({f.get("predicate") if isinstance(f, dict) else getattr(f, "predicate", "") for f in cached_entry.get("graph_facts", [])}),
@@ -1090,6 +1140,8 @@ class RetrievalOrchestrator:
                     effective_query,
                     product_names=product_names,
                     allow_global_scope=bool(getattr(intent, "aggregation_type", "")),
+                    user_id=user_id,
+                    tenant_id=tenant_id,
                 )
                 if rows:
                     cyphers_run.append(usage.get("cypher") or "CYPHER_AGGREGATION")
@@ -1120,7 +1172,11 @@ class RetrievalOrchestrator:
         hyde_doc = ""
         if enable_hyde and config.ENABLE_HYDE_IN_ORCHESTRATOR and config.ENABLE_HYDE_CACHE and intent and intent.requires_vector:
             try:
-                hyde_doc, hyde_lat = hyde.generate_hypothetical_document(effective_query)
+                hyde_doc, hyde_lat = hyde.generate_hypothetical_document(
+                    effective_query,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                )
                 logger.info("Stream HyDE: %.1fms (cached=%s)", hyde_lat, hyde_lat < 5.0)
             except Exception as exc:
                 logger.debug("Stream HyDE generation notice: %s", exc)
@@ -1137,12 +1193,16 @@ class RetrievalOrchestrator:
         needs_vector = bool(intent and intent.requires_vector)
 
         async def _stream_graph():
-            return await self._traversal.traverse(intent, resolved_entities)
+            return await self._traversal.traverse(
+                intent, resolved_entities,
+                user_id=user_id, tenant_id=tenant_id,
+            )
 
         async def _stream_vector():
             return await self._execute_plan_retrieval(
                 plan, search_query, hyde_doc,
                 top_k or self._top_k, intent, resolved_entities,
+                user_id=user_id, tenant_id=tenant_id,
             )
 
         t_retrieval_start = time.perf_counter()
@@ -1299,6 +1359,41 @@ class RetrievalOrchestrator:
                     }
                 })
 
+        # ── Build graph node/relationship lists for evidence ──────────────
+        graph_nodes = sorted({f.subject for f in facts} | {f.object for f in facts})
+        graph_relationships = sorted({f.predicate for f in facts})
+        stream_edges = [
+            {"s": f.subject, "rel": f.predicate, "o": f.object, "conf": f.properties.get("confidence", 1.0) if hasattr(f, "properties") and isinstance(f.properties, dict) else 1.0}
+            for f in facts
+        ]
+
+        # ── Cross-validation & metric provenance extraction ───────────────
+        stream_cv_report = None
+        stream_metrics = []
+        try:
+            from app.engine.cross_validation import cross_validate_answer
+            docs_for_cv = [
+                {
+                    "name": getattr(s, "document_title", None) or getattr(s, "document_id", f"Doc {idx+1}"),
+                    "document_title": getattr(s, "document_title", None) or getattr(s, "document_id", f"Doc {idx+1}"),
+                    "page": getattr(s, "page_number", None) if getattr(s, "page_number", None) is not None else getattr(s, "page", None),
+                    "snippet": getattr(s, "snippet", ""),
+                    "full_text": getattr(s, "verbatim_text", "") or getattr(s, "snippet", ""),
+                }
+                for idx, s in enumerate(context.sources if context else [])
+            ]
+            stream_cv_report = cross_validate_answer(
+                query=effective_query,
+                answer=full_answer_clean,
+                retrieved_docs=docs_for_cv,
+                graph_triplets=stream_edges,
+                query_type=intent.query_type.value if intent else "general",
+            )
+            stream_metrics = stream_cv_report.get("metrics", [])
+        except Exception as cv_exc:
+            logger.debug("Streaming cross-validation notice: %s", cv_exc)
+            stream_metrics = []
+
         # ── Cache the streamed answer ─────────────────────────────────────
         if full_answer_clean and context:
             try:
@@ -1309,6 +1404,7 @@ class RetrievalOrchestrator:
                         "confidence": "high",
                         "compliance_note": None,
                         "citations": stream_citations,
+                        "metrics": stream_metrics,
                         "provenance": [],
                         "quality_score": context.quality_score,
                         "output_tokens": len(full_answer_clean.split()) * 2,
@@ -1318,6 +1414,8 @@ class RetrievalOrchestrator:
                         "sources": [s.model_dump() if hasattr(s, "model_dump") else s for s in context.sources],
                     },
                     corpus_version=self._corpus_version,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
                 )
             except Exception as exc:
                 logger.debug("Stream cache store notice: %s", exc)
@@ -1328,14 +1426,6 @@ class RetrievalOrchestrator:
             graph_edges_found=len(facts),
             vector_chunks_retrieved=len(chunks),
         )
-
-        # ── Build graph node/relationship lists for evidence ──────────────
-        graph_nodes = sorted({f.subject for f in facts} | {f.object for f in facts})
-        graph_relationships = sorted({f.predicate for f in facts})
-        stream_edges = [
-            {"s": f.subject, "rel": f.predicate, "o": f.object, "conf": f.properties.get("confidence", 1.0) if hasattr(f, "properties") and isinstance(f.properties, dict) else 1.0}
-            for f in facts
-        ]
 
         in_toks = context.token_count if context else 0
         out_toks = len(full_answer_clean.split()) * 2
@@ -1359,6 +1449,7 @@ class RetrievalOrchestrator:
                 "chunks_streamed": chunk_index,
                 "quality_score": quality_score,
                 "quality_gate_passed": quality_gate_passed,
+                "cross_validation_ledger": stream_cv_report,
             },
             "answer": {
                 "answer": full_answer_clean,
@@ -1366,8 +1457,11 @@ class RetrievalOrchestrator:
                 "compliance_note": None,
                 "citations": stream_citations,
                 "structured_rows": [],
+                "metrics": stream_metrics,
             },
             "citations": stream_citations,
+            "metrics": stream_metrics,
+            "cross_validation_ledger": stream_cv_report,
             "graph_facts": facts,
             "graph_nodes": graph_nodes,
             "graph_relationships": graph_relationships,

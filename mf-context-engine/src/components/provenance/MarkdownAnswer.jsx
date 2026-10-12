@@ -75,6 +75,10 @@ export default function MarkdownAnswer({ text = "", citations = [], metrics = []
   }
 
   const metricMap = {};
+  const sortedMetrics = Array.isArray(metrics)
+    ? [...metrics].sort((a, b) => (b.surface_text || "").length - (a.surface_text || "").length)
+    : [];
+
   if (Array.isArray(metrics)) {
     metrics.forEach((m, idx) => {
       const marker = m.marker || `m${idx + 1}`;
@@ -178,9 +182,9 @@ export default function MarkdownAnswer({ text = "", citations = [], metrics = []
 
       // Plain text chunk: auto-detect metrics if defined
       if (chunk) {
-        if (metrics.length > 0) {
+        if (sortedMetrics.length > 0) {
           let subSegments = [chunk];
-          metrics.forEach((m) => {
+          sortedMetrics.forEach((m) => {
             if (!m.surface_text) return;
             const escaped = m.surface_text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
             const mRegex = new RegExp(`(${escaped})`, "gi");

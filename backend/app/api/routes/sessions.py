@@ -8,17 +8,25 @@
 """
 sessions.py
 ===========
-Session management API routes for reading and writing chat session files
-in logs/chat_sessions/.
+Session management API routes with strict user ownership and tenant isolation
+enforcement (Phase 2 Security Remediation).
 """
 import json
 import os
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session as DBSession
+
+from app.api.deps import CurrentUser
+from app.auth.service import AuthenticatedUser
+from app.core.database import get_db
+from app.schemas.chat_sessions_table import ChatSession
+from app.schemas.models import _now_iso
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -52,37 +60,79 @@ def _get_session_path(session_id: str) -> Path:
     return SESSIONS_DIR / f"{safe_id}.json"
 
 
-@router.get("", response_model=List[SessionItem])
-async def list_sessions(limit: int = Query(20, ge=1, le=100)) -> List[SessionItem]:
+def _verify_session_ownership(
+    session_id: str,
+    current_user: AuthenticatedUser,
+    db: DBSession,
+) -> ChatSession:
     """
-    List saved chat sessions from logs/chat_sessions/ directory.
-    Sorted by modified time (newest first), up to limit (default 20).
-    Only returns meaningful conversations that have at least one user message.
-    Corrupt, empty, or unreadable session files are skipped gracefully.
-    """
-    if not SESSIONS_DIR.exists():
-        return []
+    Verify that the current user owns the requested session.
 
-    json_paths = list(SESSIONS_DIR.glob("*.json"))
-    # Sort newest-first based on file modification time
-    sorted_paths = sorted(
-        json_paths,
-        key=lambda p: p.stat().st_mtime if p.exists() else 0,
-        reverse=True,
+    Args:
+        session_id: Session identifier
+        current_user: Authenticated user from token
+        db: Database session
+
+    Returns:
+        ChatSession: The session record if ownership is verified
+
+    Raises:
+        HTTPException(404): If session doesn't exist OR user doesn't own it
+                           (never reveal whether session exists to unauthorized users)
+    """
+    query = db.query(ChatSession).filter(
+        ChatSession.session_id == session_id,
+        ChatSession.user_id == current_user.username,
     )
 
+    # If multi-tenant, enforce tenant boundary
+    if current_user.tenant_id:
+        query = query.filter(ChatSession.tenant_id == current_user.tenant_id)
+
+    session = query.first()
+
+    if session is None:
+        # SECURITY: Return 404 regardless of whether session exists
+        # Never reveal to User A that User B's session exists
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session {session_id} not found",
+        )
+
+    return session
+
+
+@router.get("", response_model=List[SessionItem])
+async def list_sessions(
+    current_user: CurrentUser,
+    limit: int = Query(20, ge=1, le=100),
+    db: DBSession = Depends(get_db),
+) -> List[SessionItem]:
+    """
+    List saved chat sessions for the CURRENT USER ONLY.
+
+    Authorization: Only returns sessions where user_id matches the authenticated user.
+    Sorted by created_at (newest first), up to limit (default 20).
+    """
+    query = db.query(ChatSession).filter(ChatSession.user_id == current_user.username)
+    if current_user.tenant_id:
+        query = query.filter(ChatSession.tenant_id == current_user.tenant_id)
+    query = query.order_by(ChatSession.created_at.desc()).limit(limit)
+
+    sessions = query.all()
+
     results: List[SessionItem] = []
-    for path in sorted_paths:
-        if len(results) >= limit:
-            break
+    for session in sessions:
+        path = _get_session_path(session.session_id)
+        if not path.exists():
+            continue
+
         try:
             content = path.read_text(encoding="utf-8")
             data = json.loads(content)
-            
-            # Support both list of messages format and dict with history format
+
             history = data if isinstance(data, list) else data.get("history", [])
-            
-            # Extract first user message for preview (truncated to 45 chars + '…')
+
             first_query = ""
             for turn in history:
                 if isinstance(turn, dict) and turn.get("role") == "user":
@@ -90,68 +140,66 @@ async def list_sessions(limit: int = Query(20, ge=1, le=100)) -> List[SessionIte
                     if isinstance(content_val, str) and content_val.strip():
                         first_query = content_val.strip()
                         break
-            
-            # A conversation should only be in Recent Chats if it has at least one actual user message!
+
             if not first_query:
                 continue
 
-            if len(first_query) > 45:
-                preview = first_query[:44] + "…"
-            elif first_query:
-                preview = first_query
-            else:
-                preview = "(empty)"
-
+            preview = first_query[:44] + "…" if len(first_query) > 45 else first_query
             raw_title = data.get("title") if isinstance(data, dict) else None
             title = raw_title if (raw_title and raw_title.strip() and raw_title != "New Conversation") else preview
 
             turn_count = len([t for t in history if isinstance(t, dict) and t.get("role") == "user"])
-            mtime = path.stat().st_mtime
-
-            created_at = data.get("created_at") or data.get("createdAt") if isinstance(data, dict) else None
-            updated_at = data.get("updated_at") or data.get("updatedAt") if isinstance(data, dict) else None
 
             results.append(
                 SessionItem(
-                    session_id=path.stem,
+                    session_id=session.session_id,
                     preview=preview,
                     title=title,
                     turn_count=turn_count,
-                    modified_time=mtime,
-                    created_at=str(created_at) if created_at else None,
-                    updated_at=str(updated_at) if updated_at else None,
+                    modified_time=path.stat().st_mtime if path.exists() else None,
+                    created_at=session.created_at,
+                    updated_at=session.updated_at,
                 )
             )
         except Exception:
-            # Skip corrupt or unreadable session files gracefully (REQ-1.11.10)
             continue
 
     return results
 
 
 @router.get("/{session_id}")
-async def get_session(session_id: str) -> Dict[str, Any]:
+async def get_session(
+    session_id: str,
+    current_user: CurrentUser,
+    db: DBSession = Depends(get_db),
+) -> Dict[str, Any]:
     """
-    Load a session by session_id from disk.
+    Load a session by session_id - ONLY if owned by current user.
     """
+    session_record = _verify_session_ownership(session_id, current_user, db)
+
     path = _get_session_path(session_id)
     if not path.exists():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {session_id} not found",
         )
+
     try:
         content = path.read_text(encoding="utf-8")
         data = json.loads(content)
+
         if isinstance(data, list):
             return {
                 "session_id": session_id,
                 "id": session_id,
                 "history": data,
+                "user_id": session_record.user_id,
             }
-        # If dict, ensure session_id / id is populated
+
         data["session_id"] = data.get("session_id") or session_id
         data["id"] = data.get("id") or session_id
+        data["user_id"] = session_record.user_id
         return data
     except Exception as exc:
         raise HTTPException(
@@ -161,30 +209,71 @@ async def get_session(session_id: str) -> Dict[str, Any]:
 
 
 @router.post("/{session_id}")
-async def save_session(session_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+async def save_session(
+    session_id: str,
+    payload: Dict[str, Any],
+    current_user: CurrentUser,
+    db: DBSession = Depends(get_db),
+) -> Dict[str, Any]:
     """
-    Save session to logs/chat_sessions/{session_id}.json with atomic write,
-    UTF-8 encoding, 2-space indentation, and default=str for non-JSON types.
-    Only saves if session contains at least one actual user message.
+    Save session to logs/chat_sessions/{session_id}.json
+    ONLY if the session is owned by current user or is being created.
     """
     history = payload if isinstance(payload, list) else payload.get("history", [])
     has_user_msg = any(
         isinstance(t, dict) and t.get("role") == "user" and str(t.get("content", "")).strip()
         for t in history
     )
+
     if not has_user_msg:
         return {"status": "skipped", "session_id": session_id, "reason": "empty session"}
 
+    # Check if session exists in database
+    existing_session = db.query(ChatSession).filter_by(session_id=session_id).first()
+
+    now_str = _now_iso()
+    if existing_session:
+        # Existing session: verify ownership
+        if existing_session.user_id != current_user.username:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session {session_id} not found",
+            )
+        if current_user.tenant_id and existing_session.tenant_id != current_user.tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Session {session_id} not found",
+            )
+        existing_session.updated_at = now_str
+    else:
+        # New session: create with current user as owner
+        new_session = ChatSession(
+            session_id=session_id,
+            user_id=current_user.username,
+            tenant_id=current_user.tenant_id,
+            created_at=now_str,
+            updated_at=now_str,
+        )
+        db.add(new_session)
+
+    db.commit()
+
+    # Stamp user_id into JSON payload if dict
+    if isinstance(payload, dict):
+        payload["user_id"] = current_user.username
+        if current_user.tenant_id:
+            payload["tenant_id"] = current_user.tenant_id
+
+    # Write to JSON file
     path = _get_session_path(session_id)
     try:
-        # Atomic write: write to temp file first, then replace
         serialized = json.dumps(
             payload,
             ensure_ascii=False,
             indent=2,
             default=str,
         )
-        
+
         temp_fd, temp_path = tempfile.mkstemp(
             dir=str(SESSIONS_DIR),
             prefix=f"{session_id}_",
@@ -199,7 +288,7 @@ async def save_session(session_id: str, payload: Dict[str, Any]) -> Dict[str, An
                 os.remove(temp_path)
             raise
 
-        return {"status": "ok", "session_id": session_id}
+        return {"status": "ok", "session_id": session_id, "user_id": current_user.username, "rekeyed": False}
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -208,35 +297,28 @@ async def save_session(session_id: str, payload: Dict[str, Any]) -> Dict[str, An
 
 
 @router.delete("/{session_id}")
-async def delete_session(session_id: str) -> Dict[str, Any]:
+async def delete_session(
+    session_id: str,
+    current_user: CurrentUser,
+    db: DBSession = Depends(get_db),
+) -> Dict[str, Any]:
     """
-    Delete a session file if it exists, and cleans up any database row.
+    Delete a session file and database record.
+    ONLY if owned by current user.
     """
-    deleted = False
+    session_record = _verify_session_ownership(session_id, current_user, db)
+
     path = _get_session_path(session_id)
     if path.exists():
         try:
             path.unlink()
-            deleted = True
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Could not delete session {session_id}: {exc}",
             )
 
-    # Clean up from sqlite database if present
-    try:
-        from app.core.database import SessionLocal
-        from app.schemas.chat_sessions_table import ChatSession
-        with SessionLocal() as db:
-            row = db.query(ChatSession).filter_by(session_id=session_id).first()
-            if row:
-                db.delete(row)
-                db.commit()
-                deleted = True
-    except Exception:
-        pass
+    db.delete(session_record)
+    db.commit()
 
-    if deleted:
-        return {"status": "deleted", "session_id": session_id}
-    return {"status": "not_found", "session_id": session_id}
+    return {"status": "deleted", "session_id": session_id}

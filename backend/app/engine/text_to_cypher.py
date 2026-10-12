@@ -69,9 +69,28 @@ def clear_cypher_cache():
     _schema_cache = {"labels": None, "rel_types": None, "ts": 0}
 
 
-def _get_cypher_cache_key(question: str, product_names: set[str]) -> str:
+def invalidate_user_cypher_cache(user_id: str, tenant_id: Optional[str] = None) -> int:
+    """Invalidate all Cypher cache entries for a specific user."""
+    from app.core.cache_utils import invalidate_user_cache
+    return invalidate_user_cache(_CYPHER_CACHE, "cypher", user_id, tenant_id)
+
+
+def _get_cypher_cache_key(
+    question: str,
+    product_names: set[str],
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> str:
     norm_q = " ".join(question.strip().lower().split()[:25])
     sorted_prods = "|".join(sorted(product_names)) if product_names else "__none__"
+    if user_id:
+        from app.core.cache_utils import generate_cache_key
+        return generate_cache_key(
+            namespace="cypher",
+            key_components={"question": norm_q, "products": sorted_prods},
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
     raw = f"{sorted_prods}::{norm_q}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
@@ -123,6 +142,8 @@ def generate_and_run_with_correction(
     question: str,
     product_names: set[str],
     allow_global_scope: bool = False,
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
 ) -> tuple[Optional[list[dict[str, Any]]], dict]:
     """
     Generates and executes Cypher with multi-tier fallback:
@@ -141,7 +162,7 @@ def generate_and_run_with_correction(
         return None, empty_usage
 
     cache_key = _get_cypher_cache_key(
-        question, product_names or {"__global__"}
+        question, product_names or {"__global__"}, user_id=user_id, tenant_id=tenant_id
     )
 
     # Tier 1: Check Cypher cache
@@ -218,11 +239,19 @@ def generate_and_run_with_correction(
     return None, empty_usage
 
 
-def generate_and_run(question: str, product_names: set[str],
-                      allow_global_scope: bool = False
-                      ) -> tuple[Optional[list[dict[str, Any]]], dict]:
+def generate_and_run(
+    question: str,
+    product_names: set[str],
+    allow_global_scope: bool = False,
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+) -> tuple[Optional[list[dict[str, Any]]], dict]:
     """Preserves backwards compatibility with existing pipeline callers."""
     return generate_and_run_with_correction(
-        question, product_names, allow_global_scope=allow_global_scope
+        question,
+        product_names,
+        allow_global_scope=allow_global_scope,
+        user_id=user_id,
+        tenant_id=tenant_id,
     )
 

@@ -21,6 +21,7 @@ Changes vs. original:
 """
 import asyncio
 import logging
+from typing import Any, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
 from app.config import get_settings
@@ -40,10 +41,60 @@ class GraphTraversal:
         self._graph = graph
         self._max_depth = get_settings().max_traversal_depth
 
+    def _audit_traversal(
+        self,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        start_entities: list[str],
+        result_count: int,
+    ) -> None:
+        """Log graph access for security auditing."""
+        logger.info(
+            "Graph traversal: user=%s tenant=%s entities=%s results=%d",
+            user_id, tenant_id, start_entities, result_count,
+        )
+
     async def traverse(
-        self, intent: QueryIntent, entities: list[BaseEntity]
-    ) -> tuple[list[GraphFact], list[str], list[str]]:
-        """Returns (facts, traversal_path_descriptions, cypher_run)."""
+        self,
+        intent_or_entities: Any,
+        entities_or_depth: Any = None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        authorized_labels: Optional[list[str]] = None,
+    ) -> Any:
+        """Traverse graph with authorization constraints and auditing.
+
+        Supports both:
+        1. (intent: QueryIntent, entities: list[BaseEntity], user_id, tenant_id) -> (facts, paths, cyphers)
+        2. (start_entities: list[str], max_depth: int, user_id, tenant_id, authorized_labels) -> dict
+        """
+        if isinstance(intent_or_entities, list) and (entities_or_depth is None or isinstance(entities_or_depth, int)):
+            start_entities = intent_or_entities
+            max_depth = entities_or_depth if isinstance(entities_or_depth, int) else self._max_depth
+            constraints = []
+            if tenant_id:
+                constraints.append(f"n.tenant_id = '{tenant_id}'")
+            if authorized_labels:
+                label_filter = " OR ".join(f"'{label}' IN labels(n)" for label in authorized_labels)
+                constraints.append(f"({label_filter})")
+            constraint_clause = " AND ".join(constraints) if constraints else "1=1"
+            cypher = f"""
+            MATCH path = (start)-[*1..{max_depth}]-(n)
+            WHERE start.id IN $start_ids
+            AND {constraint_clause}
+            RETURN path
+            LIMIT 1000
+            """
+            try:
+                results = await self._graph.run(cypher, start_ids=start_entities)
+            except Exception as exc:
+                logger.warning("Graph query failed in parameterized traversal: %s", exc)
+                results = []
+            self._audit_traversal(user_id, tenant_id, start_entities, len(results))
+            return {"results": results, "count": len(results)}
+
+        intent: QueryIntent = intent_or_entities
+        entities: list[BaseEntity] = entities_or_depth or []
         strategy = {
             QueryType.EXPOSURE_AGGREGATION: self._exposure,
             QueryType.COMPLIANCE_CHECK: self._compliance,
@@ -52,7 +103,9 @@ class GraphTraversal:
             QueryType.GENERAL: self._noop,
         }[intent.query_type]
         # Pass intent so strategies can use taxonomy_paths as fallback
-        return await strategy(intent, entities)
+        facts, paths, cyphers = await strategy(intent, entities)
+        self._audit_traversal(user_id, tenant_id, [e.name for e in entities], len(facts))
+        return facts, paths, cyphers
 
     async def _gather_rows(self, calls: list[tuple]) -> list[list[dict]]:
         """Runs independent graph queries concurrently when parallelization is on.

@@ -49,8 +49,16 @@ class SemanticQueryCache:
             self._embedder = None
 
     @staticmethod
-    def _fingerprint(query: str) -> str:
-        """Normalized string MD5 fingerprint for O(1) exact cache probe."""
+    def _fingerprint(query: str, user_id: Optional[str] = None, tenant_id: Optional[str] = None) -> str:
+        """Normalized string fingerprint for O(1) exact cache probe with user/tenant scoping."""
+        if user_id:
+            from app.core.cache_utils import generate_cache_key
+            return generate_cache_key(
+                namespace="semantic_cache",
+                key_components={"query": query.strip().lower()},
+                user_id=user_id,
+                tenant_id=tenant_id,
+            )
         return hashlib.md5(query.strip().lower().encode("utf-8")).hexdigest()
 
     def count(self) -> int:
@@ -78,6 +86,8 @@ class SemanticQueryCache:
         query: str | np.ndarray,
         embedder: Any = None,
         corpus_version: Optional[str] = None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Look up query. Returns cached result dict if exact hit or cosine similarity >= threshold and not expired.
 
@@ -87,13 +97,17 @@ class SemanticQueryCache:
         """
         # --- Gate 1: Exact string fingerprint probe (<1ms) ---
         if isinstance(query, str) and query.strip():
-            fp = self._fingerprint(query)
+            fp = self._fingerprint(query, user_id=user_id, tenant_id=tenant_id)
             if fp in self._exact_hash_index:
                 idx = self._exact_hash_index[fp]
                 if idx < len(self._cache_data):
                     hit_data = self._cache_data[idx].copy()
                     age = time.time() - hit_data.get("timestamp", 0)
                     valid = True
+                    if user_id and hit_data.get("user_id") != user_id:
+                        valid = False
+                    if tenant_id and hit_data.get("tenant_id") != tenant_id:
+                        valid = False
                     if age > self._ttl_seconds:
                         logger.debug("Fingerprint cache entry expired (age: %.1fs > ttl: %ds)", age, self._ttl_seconds)
                         valid = False
@@ -117,42 +131,56 @@ class SemanticQueryCache:
             vec_copy = np.ascontiguousarray(self._to_vector(query, embedder), dtype="float32")
             faiss.normalize_L2(vec_copy)
 
-            scores, ids = self._index.search(vec_copy, 1)
-            score = float(scores[0][0])
-            idx = int(ids[0][0])
+            k = min(10, self._index.ntotal)
+            scores, ids = self._index.search(vec_copy, k)
 
-            if idx != -1 and score >= self._threshold and idx < len(self._cache_data):
-                hit_data = self._cache_data[idx].copy()
-                
-                # Check TTL
-                age = time.time() - hit_data.get("timestamp", 0)
-                if age > self._ttl_seconds:
-                    logger.debug("Cache entry expired (age: %.1fs > ttl: %ds)", age, self._ttl_seconds)
-                    return None
+            for rank in range(k):
+                score = float(scores[0][rank])
+                idx = int(ids[0][rank])
 
-                # Check corpus version
-                if corpus_version and hit_data.get("corpus_version") and hit_data.get("corpus_version") != corpus_version:
-                    logger.debug("Cache entry corpus mismatch (%s vs %s)", hit_data.get("corpus_version"), corpus_version)
-                    return None
+                if idx != -1 and score >= self._threshold and idx < len(self._cache_data):
+                    hit_data = self._cache_data[idx].copy()
 
-                logger.info("Semantic cache HIT (similarity: %.4f, age: %.1fs)", score, age)
-                hit_data["cache_hit"] = True
-                hit_data["cache_similarity"] = score
-                hit_data["cache_kind"] = "semantic"
-                hit_data["hit_type"] = "Semantic"
-                return hit_data
+                    # Check user and tenant scoping
+                    if user_id and hit_data.get("user_id") != user_id:
+                        continue
+                    if tenant_id and hit_data.get("tenant_id") != tenant_id:
+                        continue
 
-            logger.debug("Semantic cache MISS (best similarity: %.4f)", score if idx != -1 else 0.0)
+                    # Check TTL
+                    age = time.time() - hit_data.get("timestamp", 0)
+                    if age > self._ttl_seconds:
+                        logger.debug("Cache entry expired (age: %.1fs > ttl: %ds)", age, self._ttl_seconds)
+                        continue
+
+                    # Check corpus version
+                    if corpus_version and hit_data.get("corpus_version") and hit_data.get("corpus_version") != corpus_version:
+                        logger.debug("Cache entry corpus mismatch (%s vs %s)", hit_data.get("corpus_version"), corpus_version)
+                        continue
+
+                    logger.info("Semantic cache HIT (similarity: %.4f, age: %.1fs)", score, age)
+                    hit_data["cache_hit"] = True
+                    hit_data["cache_similarity"] = score
+                    hit_data["cache_kind"] = "semantic"
+                    hit_data["hit_type"] = "Semantic"
+                    return hit_data
+
+            logger.debug("Semantic cache MISS")
             return None
         except Exception as exc:
             logger.warning("Cache lookup error: %s", exc)
             return None
 
-    def check(self, query: str) -> Tuple[Optional[dict], float]:
+    def check(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> Tuple[Optional[dict], float]:
         """Returns (cached_payload, latency_ms) if a semantic hit is found, else (None, latency_ms).
         Compatible with engine/semantic_cache API."""
         t0 = time.perf_counter()
-        entry = self.lookup(query)
+        entry = self.lookup(query, user_id=user_id, tenant_id=tenant_id)
         latency = (time.perf_counter() - t0) * 1000.0
         return entry, latency
 
@@ -164,6 +192,8 @@ class SemanticQueryCache:
         corpus_version: Optional[str] = None,
         model_version: Optional[str] = None,
         prompt_version: Optional[str] = None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> None:
         """Store query and associated response payload in cache."""
         try:
@@ -181,12 +211,14 @@ class SemanticQueryCache:
                 "corpus_version": corpus_version,
                 "model_version": model_version,
                 "prompt_version": prompt_version,
+                "user_id": user_id,
+                "tenant_id": tenant_id,
                 **response,
             }
             new_idx = len(self._cache_data)
             self._cache_data.append(entry)
             if isinstance(query, str) and query.strip():
-                fp = self._fingerprint(query)
+                fp = self._fingerprint(query, user_id=user_id, tenant_id=tenant_id)
                 self._exact_hash_index[fp] = new_idx
             logger.info("Stored response in semantic cache (total entries: %d)", self._index.ntotal)
         except Exception as exc:
@@ -254,7 +286,7 @@ class SemanticQueryCache:
         self._cache_data = survivors
         self._vectors = survivor_vectors
         self._exact_hash_index = {
-            self._fingerprint(entry["query"]): idx
+            self._fingerprint(entry["query"], user_id=entry.get("user_id"), tenant_id=entry.get("tenant_id")): idx
             for idx, entry in enumerate(survivors)
             if entry.get("query") and isinstance(entry["query"], str)
         }
@@ -262,6 +294,49 @@ class SemanticQueryCache:
             self._index.add(vec)
 
         logger.info("Pruned %d expired semantic cache entries (%d remain).", removed, len(survivors))
+        return removed
+
+    def invalidate_user(self, user_id: str, tenant_id: Optional[str] = None) -> int:
+        """Purge all cache entries belonging to user_id (and tenant_id) and rebuild index."""
+        if not user_id or not self._cache_data:
+            return 0
+
+        clean_user = str(user_id).strip()
+        clean_tenant = str(tenant_id).strip() if tenant_id else None
+
+        survivors: list[dict[str, Any]] = []
+        survivor_vectors: list[np.ndarray] = []
+
+        for i, entry in enumerate(self._cache_data):
+            match = (entry.get("user_id") == clean_user)
+            if match and clean_tenant:
+                match = (entry.get("tenant_id") == clean_tenant)
+            if not match:
+                survivors.append(entry)
+                if i < len(self._vectors):
+                    survivor_vectors.append(self._vectors[i])
+
+        removed = len(self._cache_data) - len(survivors)
+        if removed == 0:
+            return 0
+
+        if len(survivor_vectors) != len(survivors):
+            logger.warning("Cache vector/entry mismatch during user invalidation; clearing cache instead.")
+            self.clear()
+            return removed
+
+        self._index.reset()
+        self._cache_data = survivors
+        self._vectors = survivor_vectors
+        self._exact_hash_index = {
+            self._fingerprint(entry["query"], user_id=entry.get("user_id"), tenant_id=entry.get("tenant_id")): idx
+            for idx, entry in enumerate(survivors)
+            if entry.get("query") and isinstance(entry["query"], str)
+        }
+        for vec in survivor_vectors:
+            self._index.add(vec)
+
+        logger.info("Invalidated %d semantic cache entries for user %s (%d remain).", removed, clean_user, len(survivors))
         return removed
 
     def clear(self) -> None:
@@ -282,3 +357,9 @@ def get_semantic_cache() -> UnifiedSemanticCache:
     if _global_semantic_cache is None:
         _global_semantic_cache = UnifiedSemanticCache()
     return _global_semantic_cache
+
+
+def invalidate_user_semantic_cache(user_id: str, tenant_id: Optional[str] = None) -> int:
+    """Invalidate all semantic cache entries for a specific user."""
+    return get_semantic_cache().invalidate_user(user_id, tenant_id)
+

@@ -234,9 +234,12 @@ register(PromptTemplate(
         "     * CDP: Climate Change (CDP-CC) and Water Security (CDP-WS) letter grades (e.g. A-, B).\n"
         "   - DO NOT confuse ratings across agencies (e.g. NEVER report MSCI letter grades such as CCC as Sustainalytics scores).\n"
         "2. Formatting and Tone:\n"
+        "   - Use clean, standard Markdown structure: clear section headings (##, ###), bulleted lists, and structured markdown tables.\n"
         "   - Output structured markdown tables with clear column headers (e.g. | Company | Score | Risk Category |).\n"
         "   - NEVER output raw HTML tags (do NOT output <table>, <tr>, <td>, <p>, <div>, <br>). Always use standard Markdown.\n"
         "   - NEVER wrap your entire answer in code fences (```markdown or ```html).\n"
+        "   - Numerical values and metrics directly retrieved from documents or graph facts must be stated with precision and followed immediately by their bracketed citation [N].\n"
+        "   - If any metric or calculation is an AI estimation, derived projection, or contextual assumption not explicitly found verbatim in the context, explicitly identify it (e.g. 'Based on aggregate calculation...', 'Assuming...').\n"
         "   - Follow tables with a concise bullet-point executive summary.\n"
         "   - Never repeat rows and be directly relevant to the user query."
     ),

@@ -222,13 +222,16 @@ class ReviewQueueRepository:
             finally:
                 conn.close()
 
-    async def get_pending_for_user(self, user_id: str, limit: int = 20) -> List[ReviewQueueItem]:
+    async def get_pending_for_user(self, user_id: str, tenant_id: Optional[str] = None, limit: int = 20) -> List[ReviewQueueItem]:
         """Get pending/in_review items assigned to specific user ordered by priority."""
         if self._is_mongo:
-            cursor = self._mongo_col.find({
+            query = {
                 "assigned_to": user_id,
                 "status": {"$in": [ReviewStatus.PENDING.value, ReviewStatus.IN_REVIEW.value]}
-            }).sort("priority", 1).limit(limit)
+            }
+            if tenant_id:
+                query["metadata.tenant_id"] = tenant_id
+            cursor = self._mongo_col.find(query).sort("priority", 1).limit(limit)
             return [ReviewQueueItem(**d) async for d in cursor]
 
         with self._lock:
@@ -238,9 +241,11 @@ class ReviewQueueRepository:
                     SELECT * FROM review_queue
                     WHERE assigned_to = ? AND status IN (?, ?)
                     ORDER BY priority ASC, created_at ASC
-                    LIMIT ?
-                """, (user_id, ReviewStatus.PENDING.value, ReviewStatus.IN_REVIEW.value, limit))
-                return [self._row_to_item(r) for r in cur.fetchall()]
+                """, (user_id, ReviewStatus.PENDING.value, ReviewStatus.IN_REVIEW.value))
+                items = [self._row_to_item(r) for r in cur.fetchall()]
+                if tenant_id:
+                    items = [it for it in items if not it.metadata or it.metadata.get("tenant_id") == tenant_id]
+                return items[:limit]
             finally:
                 conn.close()
 

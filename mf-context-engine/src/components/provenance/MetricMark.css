@@ -24,14 +24,14 @@
 }
 
 .mf-metric-mark--assumed {
-  border-bottom: 2px dashed #F59E0B;
-  color: var(--color-warning-text);
-  background-color: rgba(245, 158, 11, 0.08);
+  border-bottom: 2px dashed #3B82F6;
+  color: var(--color-navy-700);
+  background-color: rgba(59, 130, 246, 0.08);
 }
 
 .mf-metric-mark--verbatim:hover, .mf-metric-mark--verbatim:focus { background-color: rgba(16, 185, 129, 0.16); }
 .mf-metric-mark--computed:hover, .mf-metric-mark--computed:focus { background-color: rgba(59, 130, 246, 0.16); }
-.mf-metric-mark--assumed:hover, .mf-metric-mark--assumed:focus { background-color: rgba(245, 158, 11, 0.16); }
+.mf-metric-mark--assumed:hover, .mf-metric-mark--assumed:focus { background-color: rgba(59, 130, 246, 0.16); }
 
 /* ── Tooltip body (rendered on the inverted tooltip surface) ── */
 .mf-metric-badge {
@@ -54,8 +54,8 @@
 }
 
 .mf-metric-tag-assumed {
-  background: rgba(245, 158, 11, 0.2);
-  color: #FBBF24;
+  background: rgba(59, 130, 246, 0.2);
+  color: #60A5FA;
 }
 
 .mf-metric-surface {
@@ -108,10 +108,10 @@
 }
 
 .mf-metric-assumption-box {
-  background: rgba(245, 158, 11, 0.12);
-  border-left: 2px solid #F59E0B;
+  background: rgba(59, 130, 246, 0.12);
+  border-left: 2px solid #3B82F6;
   padding: 4px 8px;
   font-size: 0.78rem;
-  color: #FDE68A;
+  color: #BFDBFE;
   margin: 6px 0;
 }

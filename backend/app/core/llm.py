@@ -235,7 +235,7 @@ class LLMClient:
             user_content += f"\n\nRespond strictly with a valid JSON object matching this schema:\n{json.dumps(structured_schema)}"
         messages.append({"role": "user", "content": user_content})
 
-        default_tokens = 1500 if fast else self._settings.llm_max_tokens
+        default_tokens = 2500 if fast else (self._settings.llm_max_tokens or 4096)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,

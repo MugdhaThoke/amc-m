@@ -30,7 +30,9 @@ class QueryEvidence(Base):
     __tablename__ = "query_evidence"
 
     response_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    session_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(String(64), ForeignKey("chat_sessions.session_id"), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     query_text: Mapped[str] = mapped_column(Text, nullable=False)
@@ -86,6 +88,9 @@ class QueryEvidence(Base):
             name="ck_query_confidence_level",
         ),
         PrimaryKeyConstraint("session_id", "response_id", name="pk_query_evidence"),
+        Index("idx_qe_session_user", "session_id", "user_id"),
+        Index("idx_qe_user_session", "user_id", "session_id"),
+        Index("idx_qe_tenant_user", "tenant_id", "user_id"),
         Index("idx_query_evidence_entry_route", "entry_route"),
         Index("idx_query_evidence_root_cause", "root_cause"),
         Index("idx_query_evidence_unified_ref", "unified_record_ref"),

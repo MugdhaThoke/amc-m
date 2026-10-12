@@ -8,6 +8,7 @@ import uuid
 from app.core.database import Base
 from sqlalchemy import (
     ForeignKey,
+    Index,
     String,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -21,7 +22,16 @@ class ChatSession(Base):
     session_id: Mapped[str] = mapped_column(
         String(64), primary_key=True, default=lambda: str(uuid.uuid4())
     )
-    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    user_id: Mapped[str] = mapped_column(
+        String(36),
+        nullable=False,
+        index=True,
+    )
+    tenant_id: Mapped[str | None] = mapped_column(
+        String(36),
+        nullable=True,
+        index=True,
+    )
 
     created_at: Mapped[str] = mapped_column(String(40), nullable=False, default=_now_iso, index=True)
     updated_at: Mapped[str] = mapped_column(String(40), nullable=False, default=_now_iso)
@@ -29,4 +39,9 @@ class ChatSession(Base):
 
     audit_id: Mapped[str | None] = mapped_column(
         String(64), ForeignKey("audit_metadata.audit_id"), nullable=True, index=True
+    )
+
+    __table_args__ = (
+        Index("idx_session_user_tenant", "user_id", "tenant_id"),
+        Index("idx_session_user_created", "user_id", "created_at"),
     )

@@ -80,6 +80,8 @@ QUERY_EVIDENCE_COLUMNS: tuple[str, ...] = (
     # Identifiers
     "response_id",
     "session_id",
+    "user_id",
+    "tenant_id",
     "request_id",
     # Query metadata
     "query_text",
@@ -114,6 +116,7 @@ QUERY_EVIDENCE_COLUMNS: tuple[str, ...] = (
 SESSION_COLUMNS: tuple[str, ...] = (
     "session_id",
     "user_id",
+    "tenant_id",
     "created_at",
     "updated_at",
     "ended_at",
@@ -310,6 +313,8 @@ class QueryEvidenceRecorder:
         query_text: str,
         assembled_context_json: Mapping[str, Any],
         synthesis_output_json: Mapping[str, Any],
+        user_id: str,
+        tenant_id: Optional[str] = None,
         request_id: Optional[str] = None,
         query_type: Optional[str] = None,
         query_intent: Optional[str] = None,
@@ -322,18 +327,25 @@ class QueryEvidenceRecorder:
         confidence_level: Optional[str] = None,
         audit_id: Optional[str] = None,
         linked_violations: Optional[Iterable[str]] = None,
-        user_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Write one query_evidence record to both JSON logs and data.db. Returns it, or None if not recorded.
 
-        Never raises: audit logging must not fail a chat turn.
+        SECURITY: user_id is now MANDATORY. Never record evidence without
+        associating it to an authenticated user and verifying session ownership.
         """
         if not _enabled():
             return None
+
+        if not user_id or not str(user_id).strip():
+            logger.error("Attempted to record query_evidence without user_id (response_id=%s)", response_id)
+            return None  # SECURITY: Refuse to record anonymous evidence
+
         try:
             record = {
                 "response_id": response_id,
                 "session_id": session_id,
+                "user_id": user_id,
+                "tenant_id": tenant_id,
                 "request_id": request_id,
                 "query_text": query_text,
                 "query_type": query_type,
@@ -360,16 +372,59 @@ class QueryEvidenceRecorder:
                 "archived": False,
             }
             record = {k: record[k] for k in QUERY_EVIDENCE_COLUMNS}
-            
+
+            # Verify session ownership before recording
+            try:
+                from app.core.database import SessionLocal
+                from app.schemas.chat_sessions_table import ChatSession
+                from app.schemas.models import _now_iso
+
+                db = SessionLocal()
+                try:
+                    session_record = db.query(ChatSession).filter_by(session_id=session_id).first()
+
+                    if session_record:
+                        # Session exists: verify it belongs to this user
+                        if session_record.user_id != user_id:
+                            logger.error(
+                                "User %s attempted to record evidence in session %s owned by %s",
+                                user_id, session_id, session_record.user_id,
+                            )
+                            return None  # SECURITY: Reject cross-user evidence recording
+
+                        if tenant_id and session_record.tenant_id != tenant_id:
+                            logger.error(
+                                "Tenant mismatch: evidence tenant=%s, session tenant=%s",
+                                tenant_id, session_record.tenant_id,
+                            )
+                            return None
+                    else:
+                        # New session: create it with proper ownership
+                        now_str = _now_iso()
+                        new_session = ChatSession(
+                            session_id=session_id,
+                            user_id=user_id,
+                            tenant_id=tenant_id,
+                            created_at=now_str,
+                            updated_at=now_str,
+                        )
+                        db.add(new_session)
+                        db.commit()
+                finally:
+                    db.close()
+            except Exception as session_check_exc:
+                logger.error("Session ownership check failed: %s", session_check_exc)
+                return None
+
             # Write to JSON logs (legacy)
-            self._append(record, user_id=user_id)
-            
+            self._append(record, user_id=user_id, tenant_id=tenant_id)
+
             # Also write to data.db (single source of truth)
             try:
                 self._write_to_data_db(record)
             except Exception as db_exc:
                 logger.debug("Could not write QueryEvidence to data.db (not critical): %s", db_exc)
-            
+
             return record
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("query_evidence recording skipped: %s", exc)
@@ -382,10 +437,11 @@ class QueryEvidenceRecorder:
         query_text: str,
         result: Mapping[str, Any],
         hybrid: Mapping[str, Any],
+        user_id: str,
+        tenant_id: Optional[str] = None,
         serving_engine: str = "legacy",
         request_id: Optional[str] = None,
         audit_id: Optional[str] = None,
-        user_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Adapter for the legacy engine: ``retrieval.hybrid_graphrag`` result
         (``result``) plus the assembled ``hybrid`` payload the chat route
@@ -433,6 +489,7 @@ class QueryEvidenceRecorder:
                 confidence_level=confidence,
                 audit_id=audit_id,
                 user_id=user_id,
+                tenant_id=tenant_id,
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("query_evidence recording skipped: %s", exc)
@@ -444,11 +501,12 @@ class QueryEvidenceRecorder:
         session_id: str,
         query_text: str,
         hybrid: Mapping[str, Any],
+        user_id: str,
+        tenant_id: Optional[str] = None,
         intent: Any = None,
         trace: Any = None,
         serving_engine: str = "v2",
         audit_id: Optional[str] = None,
-        user_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         """Adapter for the v2 orchestrator path (``container.orchestrator.answer``)."""
         if not _enabled():
@@ -495,6 +553,7 @@ class QueryEvidenceRecorder:
                 confidence_level=confidence,
                 audit_id=audit_id,
                 user_id=user_id,
+                tenant_id=tenant_id,
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("query_evidence recording skipped: %s", exc)
@@ -555,7 +614,7 @@ class QueryEvidenceRecorder:
                 pass
             raise
 
-    def _append(self, record: Mapping[str, Any], *, user_id: Optional[str] = None) -> None:
+    def _append(self, record: Mapping[str, Any], *, user_id: Optional[str] = None, tenant_id: Optional[str] = None) -> None:
         path = self._path(record["session_id"])
         now = record.get("created_at") or _utc_now()
         with _write_lock:
@@ -567,6 +626,7 @@ class QueryEvidenceRecorder:
                 "session": {
                     "session_id": record["session_id"],
                     "user_id": user_id,
+                    "tenant_id": tenant_id,
                     "created_at": now,
                     "updated_at": now,
                     "ended_at": None,
@@ -581,6 +641,8 @@ class QueryEvidenceRecorder:
             session["updated_at"] = now
             if user_id and not session.get("user_id"):
                 session["user_id"] = user_id
+            if tenant_id and not session.get("tenant_id"):
+                session["tenant_id"] = tenant_id
             if record.get("audit_id") and not session.get("audit_id"):
                 session["audit_id"] = record["audit_id"]
 
@@ -613,6 +675,8 @@ class QueryEvidenceRecorder:
                     qe = QueryEvidence(
                         response_id=record.get("response_id"),
                         session_id=record.get("session_id"),
+                        user_id=record.get("user_id"),
+                        tenant_id=record.get("tenant_id"),
                         request_id=record.get("request_id"),
                         query_text=record.get("query_text"),
                         query_type=record.get("query_type"),

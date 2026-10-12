@@ -3,9 +3,9 @@ import Tooltip from "./Tooltip";
 import "./MetricMark.css";
 
 const PROVENANCE_LABELS = {
-  verbatim: { label: "From source", color: "#10B981", badgeClass: "mf-metric-tag-verbatim" },
+  verbatim: { label: "From Source", color: "#10B981", badgeClass: "mf-metric-tag-verbatim" },
   computed: { label: "Calculated", color: "#3B82F6", badgeClass: "mf-metric-tag-computed" },
-  assumed: { label: "Assumption", color: "#F59E0B", badgeClass: "mf-metric-tag-assumed" },
+  assumed: { label: "AI Assumed", color: "#3B82F6", badgeClass: "mf-metric-tag-assumed" },
 };
 
 export default function MetricMark({ metric, children }) {

@@ -271,7 +271,8 @@ backend/logs/
 
 # Large ML model files
 backend/models/
-models/
+/models/
+!backend/app/models/
 
 # ============================================================================
 # NODE.JS / JAVASCRIPT / TYPESCRIPT ARTIFACTS
