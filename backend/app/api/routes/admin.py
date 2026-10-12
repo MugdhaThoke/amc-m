@@ -779,6 +779,14 @@ async def clear_intent_cache_endpoint() -> Dict[str, Any]:
     except Exception:
         pass
 
+    # 5. Clear Feedback Intent Matcher pending notice cache
+    try:
+        from app.feedback.intent_matcher import clear_pending_feedback_cache
+        clear_pending_feedback_cache(suppress_prior_feedbacks=True)
+        cleared_layers.append("feedback_pending_notice_cache")
+    except Exception:
+        pass
+
     return {
         "success": True,
         "cleared": True,

@@ -2527,6 +2527,120 @@ table.stDataFrame td.idx, table.stDataFrame th.idx { color: var(--color-ink-400)
   background: var(--color-danger-strong);
 }
 
+/* ── Pending Feedback Repair Notice Banner ── */
+.cg-pending-feedback-banner {
+  background: var(--color-warning-bg, #fffbeb);
+  border: 1px solid var(--color-warning-border, #fde68a);
+  border-left: 4px solid var(--color-warning-strong, #d97706);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 10px 0 12px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: stFadeDown var(--duration-fast, 0.2s) var(--ease-out, ease-out);
+}
+
+.cg-pending-feedback-banner-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.cg-pending-feedback-banner-icon {
+  color: var(--color-warning-strong, #d97706);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.cg-pending-feedback-banner-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.cg-pending-feedback-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--color-ink-warm-900, #1c1917);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cg-pending-feedback-badge {
+  font-size: 10px;
+  font-weight: 600;
+  background: rgba(217, 119, 6, 0.15);
+  color: var(--color-warning-strong, #b45309);
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(217, 119, 6, 0.25);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.cg-pending-feedback-message {
+  font-size: 12px;
+  color: var(--color-ink-warm-800, #292524);
+  line-height: 1.45;
+  margin-top: 3px;
+}
+
+.cg-pending-feedback-status-pill {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fde68a;
+}
+
+.cg-pending-feedback-note {
+  font-size: 11px;
+  color: var(--color-ink-warm-500, #78716c);
+  margin-top: 4px;
+  font-style: italic;
+}
+
+.cg-pending-feedback-details {
+  margin-top: 6px;
+  font-size: 11px;
+  border-top: 1px dashed rgba(217, 119, 6, 0.25);
+  padding-top: 6px;
+}
+
+.cg-pending-feedback-details summary {
+  cursor: pointer;
+  color: var(--color-navy-700, #1e3a8a);
+  font-weight: 600;
+  user-select: none;
+}
+
+.cg-pending-feedback-details summary:hover {
+  text-decoration: underline;
+}
+
+.cg-pending-feedback-details-content {
+  margin-top: 6px;
+  padding-left: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  color: var(--color-ink-warm-700, #44403c);
+}
+
+.cg-pending-feedback-details-content code {
+  font-size: 10.5px;
+  padding: 1px 4px;
+  background: rgba(0, 0, 0, 0.04);
+  border-radius: 3px;
+  word-break: break-all;
+}
+
 /* ── Clickable Citation Links in Sources block ── */
 .cg-citation-item {
   display: flex;

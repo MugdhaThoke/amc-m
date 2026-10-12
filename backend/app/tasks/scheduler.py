@@ -454,6 +454,11 @@ class TaskScheduler:
             nxt = None
             if getattr(job, "next_run_time", None):
                 nxt = job.next_run_time.isoformat()
+            elif hasattr(job, "trigger") and hasattr(job.trigger, "get_next_fire_time"):
+                tz = getattr(job.trigger, "timezone", None) or timezone.utc
+                fire_time = job.trigger.get_next_fire_time(None, datetime.now(tz))
+                if fire_time:
+                    nxt = fire_time.isoformat()
             jobs.append({
                 "id": job.id,
                 "name": job.name,

@@ -13,6 +13,58 @@ import "./MarkdownAnswer.css";
 export default function MarkdownAnswer({ text = "", citations = [], metrics = [] }) {
   if (!text) return null;
 
+  let cleanText = typeof text === "string" ? text : "";
+  if (!cleanText.trim()) return null;
+
+  // 1. Strip outer markdown or code fences (e.g. ```markdown ... ``` or ``` ... ```)
+  cleanText = cleanText.trim();
+  const fenceMatch = cleanText.match(/^```(?:markdown|html|md)?\s*\r?\n([\s\S]*?)\r?\n```$/);
+  if (fenceMatch) {
+    cleanText = fenceMatch[1].trim();
+  }
+
+  // 2. Normalize HTML tables into Markdown tables if raw HTML table tags were returned
+  if (/<table[\s>]/i.test(cleanText)) {
+    cleanText = cleanText.replace(/<table[\s\S]*?<\/table>/gi, (tableHtml) => {
+      try {
+        const rows = [];
+        const trMatches = tableHtml.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+        for (const tr of trMatches) {
+          const cells = [];
+          const cellMatches = tr.match(/<(?:td|th)[\s\S]*?<\/(?:td|th)>/gi) || [];
+          for (const cell of cellMatches) {
+            const inner = cell.replace(/<[^>]+>/g, "").trim().replace(/\|/g, "\\|");
+            cells.push(inner);
+          }
+          if (cells.length > 0) {
+            rows.push(cells);
+          }
+        }
+        if (rows.length === 0) return tableHtml;
+        const maxCols = Math.max(...rows.map((r) => r.length));
+        const normalizedRows = rows.map((r) => {
+          while (r.length < maxCols) r.push("");
+          return `| ${r.join(" | ")} |`;
+        });
+        const separator = `| ${new Array(maxCols).fill("---").join(" | ")} |`;
+        return "\n\n" + [normalizedRows[0], separator, ...normalizedRows.slice(1)].join("\n") + "\n\n";
+      } catch (e) {
+        return tableHtml;
+      }
+    });
+  }
+
+  // 3. Clean remaining raw HTML line breaks or paragraph tags
+  cleanText = cleanText
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>\s*<p>/gi, "\n\n")
+    .replace(/<\/?(?:p|div|span)[^>]*>/gi, "");
+
+  // 4. Normalize comma-separated bracket citations (e.g. [1, 2] or [1,2,3]) into separate [1] [2] tokens
+  cleanText = cleanText.replace(/\[(\d+(?:\s*,\s*\d+)+)\]/g, (_, nums) => {
+    return nums.split(/\s*,\s*/).map((n) => `[${n}]`).join(" ");
+  });
+
   // 1. Build lookup dictionaries
   const citationMap = {};
   if (Array.isArray(citations)) {
@@ -171,7 +223,7 @@ export default function MarkdownAnswer({ text = "", citations = [], metrics = []
   };
 
   // 3. Block-level parsing (Tables, Lists, Headings, Paragraphs)
-  const lines = text.split("\n");
+  const lines = cleanText.split("\n");
   const blocks = [];
   let currentTable = null;
   let currentList = null;

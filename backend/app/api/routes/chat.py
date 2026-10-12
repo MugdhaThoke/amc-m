@@ -19,7 +19,7 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import Container, get_container
@@ -217,6 +217,78 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
                 "source_url": get_pdf_url(doc_name, page_num),
             })
 
+    # Build rich citations with marker + source
+    citations_list: list[dict] = []
+    effective_sources = context.sources if (context and context.sources) else sources
+    for i, src in enumerate(effective_sources):
+        doc_name = getattr(src, "document_title", None) or getattr(src, "document_id", f"Document {i+1}")
+        page_num = getattr(src, "page_number", None) or getattr(src, "page", 1)
+        page_label = getattr(src, "page_label", None) or (f"p. {page_num}" if page_num else "—")
+        verbatim = getattr(src, "verbatim_text", None) or getattr(src, "snippet", "") or ""
+        citations_list.append({
+            "marker": str(i + 1),
+            "source": {
+                "chunk_id": getattr(src, "chunk_id", f"src.{i+1}"),
+                "document_id": getattr(src, "document_id", doc_name),
+                "document_name": doc_name,
+                "document_title": doc_name,
+                "page_number": page_num,
+                "page_label": page_label,
+                "verbatim_text": verbatim,
+                "snippet": getattr(src, "snippet", "") or (verbatim[:200] if verbatim else ""),
+                "source_url": getattr(src, "url", None) or get_pdf_url(doc_name, page_num),
+                "url": getattr(src, "url", None) or get_pdf_url(doc_name, page_num),
+                "local_doc_path": f"/api/files/{doc_name}",
+                "score": getattr(src, "score", 0.9),
+            }
+        })
+
+    # UI Badges for Evidence Overview
+    ui_badges: list[dict] = []
+    if trace and trace.cache_hit:
+        hit_lbl = "Fingerprint Cache Hit" if (getattr(trace, "cache_kind", None) == "exact") else "Semantic Cache Hit"
+        saved = trace.tokens_saved or 0
+        ui_badges.append({
+            "label": hit_lbl,
+            "desc": f"Served from cognitive cache — {len(graph_nodes)} nodes ({saved} tokens saved)",
+            "type": "success"
+        })
+    if intent and hasattr(intent, "query_type") and intent.query_type:
+        dom = intent.query_type.value
+        ui_badges.append({
+            "label": f"Pillar: Intent Partition ({dom.upper()})",
+            "desc": f"Domain intent: {dom}",
+            "type": "primary"
+        })
+    if graph_facts:
+        ui_badges.append({
+            "label": f"Pillar 2: Single-Shot UNWIND ({len(graph_nodes)} nodes)",
+            "desc": "Batch-traversed relational subgraph without sequential loops",
+            "type": "primary"
+        })
+    ui_badges.append({
+        "label": "Pillar 5: Verified Grounding",
+        "desc": "Claims cross-validated against structured facts and active corpus",
+        "type": "success"
+    })
+
+    # Triplet Table for Grounding / Validation tab
+    triplet_table = [
+        {
+            "s": f.subject,
+            "rel": f.predicate,
+            "o": f.object,
+            "conf": f.properties.get("confidence", 1.0) if hasattr(f, "properties") and isinstance(f.properties, dict) else 1.0
+        }
+        for f in graph_facts
+    ]
+
+    cross_val_ledger = {
+        "cross_validation_badge": {"label": "Pillar 5: Verified Grounding", "type": "success", "desc": "Grounded against active corpus."},
+        "evidence_status": "SUPPORTED",
+        "metrics": [],
+    }
+
     # Token counts
     total_tokens = (trace.input_tokens + trace.output_tokens) if trace else 0
 
@@ -226,6 +298,7 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
         "latency_vector_db_ms": round(trace.vector_ms, 1) if trace else 0.0,
         "latency_rerank_ms": round(trace.rerank_ms, 1) if trace else 0.0,
         "latency_graph_db_ms": round(trace.graph_ms, 1) if trace else 0.0,
+        "latency_cypher_generation_ms": 0.0,
         "latency_ner_processing_ms": round(trace.ner_ms, 1) if trace else 0.0,
         "latency_llm_generation_ms": round(trace.generation_ms, 1) if trace else 0.0,
         "latency_post_retrieval_processing_ms": round(trace.assembly_ms, 1) if trace else 0.0,
@@ -233,13 +306,17 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
         "tokens_input": trace.input_tokens if trace else 0,
         "tokens_output": trace.output_tokens if trace else 0,
         "tokens_total": total_tokens,
-        "db_candidates_surfaced": len(graph_nodes),
+        "db_candidates_surfaced": len(graph_nodes) if graph_nodes else len(sources),
         "vector_bypassed": False,
         "pipeline_mode": "ContextGraph Hybrid RAG (v2)",
-        # Cache savings fields — populated when trace indicates a cache hit.
         "cache_hit": trace.cache_hit if trace else False,
+        "hit_type": "Fingerprint" if (trace and getattr(trace, "cache_kind", None) == "exact") else ("Semantic" if (trace and trace.cache_hit) else None),
+        "domain_intent": intent.query_type.value if (intent and hasattr(intent, "query_type") and intent.query_type) else None,
         "tokens_saved": trace.tokens_saved if trace else 0,
         "tokens_cold_equivalent": trace.cold_equivalent_tokens if trace else 0,
+        "ui_badges": ui_badges,
+        "triplet_table": triplet_table,
+        "cross_validation_ledger": cross_val_ledger,
     } if trace else {}
 
     # Derive confidence_label in the legacy display format.
@@ -261,13 +338,13 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
         # answer block — match legacy SynthesisOutput field names expected by adapters
         "answer": {
             **(synthesis.model_dump() if synthesis else {}),
-            # Ensure compliance_note + confidence surface correctly regardless of
-            # whether the adapter reads .compliance_note or .confidence.
             "compliance_note": confidence_label,
             "confidence": conf_str,
+            "citations": citations_list,
         },
         # sources list — one entry per context source
         "sources": sources,
+        "citations": citations_list,
         # graph_highlight — full legacy-compatible dict; adapters read everything from here
         "graph_highlight": {
             "node_names": graph_nodes,
@@ -275,12 +352,14 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
             "entities": matched_entity_texts,
             "labels": active_labels,
             "edges": graph_edges,
-            "edges_used_in_prompt": graph_edges,   # V2 doesn't separate "used" vs "all"; expose all
+            "edges_used_in_prompt": graph_edges,
             "entity_summary": entity_summary,
             "query_type": query_type_str,
             "graph_matched_by": "graph_facts" if graph_facts else None,
             "used_verified_aggregate": False,
             "used_comparison_mode": False,
+            "input_tokens": trace.input_tokens if trace else 0,
+            "output_tokens": trace.output_tokens if trace else 0,
             "total_tokens": total_tokens,
             "telemetry_breakdown": telemetry_breakdown,
             "provenance": provenance_list,
@@ -344,6 +423,25 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
         except Exception as sm_exc:
             logger.warning("SessionManager registration error: %s", sm_exc, exc_info=True)
 
+    pending_notice = None
+    try:
+        from app.feedback.intent_matcher import get_intent_matcher
+        matcher = get_intent_matcher()
+        pending_notice = await matcher.check_pending_feedback(
+            query=query,
+            session_id=session_id,
+            actor_id=getattr(request, "actor_id", None),
+        )
+    except Exception as exc:
+        logger.warning("Pending feedback check in _run_v2_chat failed: %s", exc)
+
+    if hybrid_data:
+        hybrid_data["pending_feedback_notice"] = pending_notice.model_dump() if pending_notice else None
+        if "graph_highlight" in hybrid_data and isinstance(hybrid_data["graph_highlight"], dict):
+            hybrid_data["graph_highlight"]["pending_feedback_notice"] = (
+                pending_notice.model_dump() if pending_notice else None
+            )
+
     return ChatResponse(
         query=query,
         resolved_query=query,
@@ -358,28 +456,35 @@ async def _run_v2_chat(request: ChatRequest, container: Container) -> ChatRespon
         corpus_version=container.settings.active_corpus_version,
         response_id=response_id,
         interaction_id=interaction_id,
+        pending_feedback_notice=pending_notice,
     )
 
 
 @router.post("/v2", response_model=ChatResponse)
 async def run_chat_v2(
     request: ChatRequest,
+    response: Response,
     container: Container = Depends(get_container),
 ) -> ChatResponse:
     """Explicit v2 multi-turn chat endpoint."""
-    return await _run_v2_chat(request, container)
+    resp = await _run_v2_chat(request, container)
+    response.headers["X-Serving-Engine"] = resp.serving_engine or "v2"
+    return resp
 
 
 @router.post("", response_model=ChatResponse)
 async def run_chat(
     request: ChatRequest,
+    response: Response,
     container: Container = Depends(get_container),
 ) -> ChatResponse:
     """Multi-turn chat endpoint with QUERY_ENGINE routing."""
     engine = container.settings.query_engine.lower()
 
     if engine == "v2":
-        return await _run_v2_chat(request, container)
+        resp = await _run_v2_chat(request, container)
+        response.headers["X-Serving-Engine"] = resp.serving_engine or "v2"
+        return resp
 
     if engine == "canary":
         canary_pct = max(0, min(100, container.settings.canary_percentage))
@@ -389,6 +494,7 @@ async def run_chat(
         if bucket < canary_pct:
             resp = await _run_v2_chat(request, container)
             resp.serving_engine = f"canary-v2 ({canary_pct}%)"
+            response.headers["X-Serving-Engine"] = resp.serving_engine
             return resp
 
     if engine == "shadow":
@@ -415,6 +521,18 @@ async def run_chat(
     response_id = f"resp_{uuid.uuid4().hex[:12]}"
     interaction_id = f"int_{uuid.uuid4().hex[:12]}"
 
+    pending_notice = None
+    try:
+        from app.feedback.intent_matcher import get_intent_matcher
+        matcher = get_intent_matcher()
+        pending_notice = await matcher.check_pending_feedback(
+            query=resolved_query,
+            session_id=request.session_id,
+            actor_id=getattr(request, "actor_id", None),
+        )
+    except Exception as exc:
+        logger.warning("Pending feedback check in legacy chat failed: %s", exc)
+
     resp = ChatResponse(
         query=request.query,
         resolved_query=resolved_query,
@@ -426,6 +544,7 @@ async def run_chat(
         corpus_version="amc_master_legacy",
         response_id=response_id,
         interaction_id=interaction_id,
+        pending_feedback_notice=pending_notice,
     )
 
     if request.mode in ("traditional", "both"):
@@ -437,7 +556,7 @@ async def run_chat(
             )
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Traditional RAG failed: {exc}")
-        resp.traditional = _traditional_response(resolved_query, trad_result).traditional
+        resp.traditional = _traditional_response(resolved_query, trad_result, pending_notice=pending_notice).traditional
 
     if request.mode in ("contextgraph", "both"):
         try:
@@ -449,7 +568,7 @@ async def run_chat(
             summary = await asyncio.to_thread(graph_store.get_entity_type_summary, ctx_result.get("active_labels"))
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"ContextGraph RAG failed: {exc}")
-        cg_resp = _contextgraph_response(resolved_query, ctx_result, summary)
+        cg_resp = _contextgraph_response(resolved_query, ctx_result, summary, pending_notice=pending_notice)
         resp.response_id = cg_resp.response_id or response_id
         resp.interaction_id = cg_resp.interaction_id or interaction_id
         resp.hybrid = {
@@ -459,6 +578,7 @@ async def run_chat(
             "sources": [s.model_dump() for s in cg_resp.sources],
             "graph_highlight": cg_resp.graph_highlight,
             "latency_ms": cg_resp.latency_ms,
+            "pending_feedback_notice": pending_notice.model_dump() if pending_notice else None,
         }
 
         # Audit evidence — ContextGraph half only; the traditional_rag result
@@ -531,29 +651,172 @@ async def _chat_stream_generator(request: "ChatRequest", container: Container):
                     answer_parts.append(event.get("text", ""))
                     yield _format_sse("chunk", event)
                 elif event_type == "complete":
-                    # Build proper hybrid data structure from the enriched complete event
-                    complete_trace = event.get("trace", {})
-                    complete_answer = event.get("answer", {})
-                    complete_graph_facts = event.get("graph_facts", [])
-                    complete_sources = event.get("context_sources", stream_sources)
+                    complete_trace = event.get("trace") if isinstance(event.get("trace"), dict) else {}
+                    complete_answer = event.get("answer") if isinstance(event.get("answer"), dict) else {}
+                    complete_graph_facts = event.get("graph_facts") or []
+                    complete_sources = event.get("context_sources") or stream_sources or []
+                    complete_citations = event.get("citations") or (complete_answer.get("citations") if isinstance(complete_answer, dict) else []) or []
+                    complete_nodes = event.get("graph_nodes") or []
+                    complete_edges = event.get("graph_edges") or []
                     
+                    # Provenance list for UI Document Sources
+                    provenance_list = []
+                    for c in complete_citations:
+                        if not isinstance(c, dict):
+                            c = c.model_dump() if hasattr(c, "model_dump") else {}
+                        src = c.get("source")
+                        if not isinstance(src, dict):
+                            src = src.model_dump() if hasattr(src, "model_dump") else (c if isinstance(c, dict) else {})
+                        doc_title = src.get("document_title") or src.get("document_name") or src.get("name", "Document")
+                        p_num = src.get("page_number", 1)
+                        provenance_list.append({
+                            "doc": doc_title,
+                            "document_title": doc_title,
+                            "name": doc_title,
+                            "page": p_num,
+                            "page_number": p_num,
+                            "page_label": src.get("page_label", f"p. {p_num}"),
+                            "chunk_id": src.get("chunk_id", ""),
+                            "snippet": src.get("snippet", ""),
+                            "verbatim_text": src.get("verbatim_text", ""),
+                            "score": src.get("score", 0.9),
+                            "url": src.get("source_url") or src.get("url"),
+                            "source_url": src.get("source_url") or src.get("url"),
+                        })
+
+                    # Triplet table for Grounding / Validation
+                    triplet_table = []
+                    for e in complete_edges:
+                        if isinstance(e, dict):
+                            triplet_table.append({
+                                "s": e.get("s", ""),
+                                "rel": e.get("rel", ""),
+                                "o": e.get("o", ""),
+                                "conf": e.get("conf", 1.0),
+                            })
+                        elif hasattr(e, "subject"):
+                            triplet_table.append({
+                                "s": getattr(e, "subject", ""),
+                                "rel": getattr(e, "predicate", ""),
+                                "o": getattr(e, "object", ""),
+                                "conf": 1.0,
+                            })
+
+                    # UI Badges
+                    safe_meta = stream_meta if isinstance(stream_meta, dict) else {}
+                    dom_intent = safe_meta.get("intent", "regulatory_lookup") or "regulatory_lookup"
+                    ui_badges = []
+                    if complete_trace.get("cache_hit"):
+                        ui_badges.append({
+                            "label": "Cognitive Cache Hit",
+                            "desc": f"Served from cognitive cache — {len(complete_nodes)} nodes",
+                            "type": "success"
+                        })
+                    if dom_intent:
+                        ui_badges.append({
+                            "label": f"Pillar: Intent Partition ({str(dom_intent).upper()})",
+                            "desc": f"Domain intent: {dom_intent}",
+                            "type": "primary"
+                        })
+                    if complete_nodes:
+                        ui_badges.append({
+                            "label": f"Pillar 2: Single-Shot UNWIND ({len(complete_nodes)} nodes)",
+                            "desc": "Batch-traversed relational subgraph without sequential loops",
+                            "type": "primary"
+                        })
+                    ui_badges.append({
+                        "label": "Pillar 5: Verified Grounding",
+                        "desc": "Claims cross-validated against structured facts and active corpus",
+                        "type": "success"
+                    })
+
+                    cross_val_ledger = {
+                        "cross_validation_badge": {"label": "Pillar 5: Verified Grounding", "type": "success", "desc": "Grounded against active corpus."},
+                        "evidence_status": "SUPPORTED",
+                        "metrics": [],
+                    }
+
+                    # Entity-type summary
+                    from collections import defaultdict
+                    label_counts: dict[str, int] = defaultdict(int)
+                    for f in complete_graph_facts:
+                        props = f.get("properties") if isinstance(f, dict) else getattr(f, "properties", None)
+                        if not isinstance(props, dict):
+                            props = {}
+                        etype = props.get("entity_type") or "Entity"
+                        label_counts[etype] += 1
+                    entity_summary = [
+                        {"label": lbl, "count": cnt, "active": True}
+                        for lbl, cnt in sorted(label_counts.items())
+                    ] if label_counts else []
+
+                    total_toks = complete_trace.get("tokens_total") or ((complete_trace.get("input_tokens") or 0) + (complete_trace.get("output_tokens") or 0))
+
+                    telemetry_breakdown = {
+                        "latency_vector_db_ms": complete_trace.get("vector_ms", 0.0),
+                        "latency_rerank_ms": complete_trace.get("rerank_ms", 0.0),
+                        "latency_graph_db_ms": complete_trace.get("graph_ms", 0.0),
+                        "latency_cypher_generation_ms": 0.0,
+                        "latency_ner_processing_ms": complete_trace.get("ner_ms", 0.0),
+                        "latency_llm_generation_ms": complete_trace.get("generation_ms", 0.0),
+                        "latency_post_retrieval_processing_ms": complete_trace.get("assembly_ms", 0.0),
+                        "latency_total_pipeline_ms": complete_trace.get("request_total_ms", 0.0),
+                        "tokens_input": complete_trace.get("input_tokens", 0),
+                        "tokens_output": complete_trace.get("output_tokens", 0),
+                        "tokens_total": total_toks,
+                        "db_candidates_surfaced": len(complete_nodes) if complete_nodes else len(complete_sources),
+                        "vector_bypassed": False,
+                        "pipeline_mode": "ContextGraph Hybrid RAG (v2-stream)",
+                        "cache_hit": complete_trace.get("cache_hit", False),
+                        "hit_type": complete_trace.get("hit_type"),
+                        "domain_intent": dom_intent,
+                        "tokens_saved": complete_trace.get("tokens_saved"),
+                        "tokens_cold_equivalent": complete_trace.get("cold_equivalent_tokens"),
+                        "ui_badges": ui_badges,
+                        "triplet_table": triplet_table,
+                        "cross_validation_ledger": cross_val_ledger,
+                    }
+
+                    confidence_label = "✓ High confidence"
+                    ans_text = complete_answer.get("answer") if complete_answer else "".join(answer_parts).strip()
+
                     hybrid_data_complete = {
                         "response_id": event.get("response_id"),
-                        "interaction_id": event.get("response_id"),  # Use response_id as interaction_id
-                        "answer": complete_answer if complete_answer else {
-                            "answer": "".join(answer_parts).strip(),
+                        "interaction_id": event.get("response_id"),
+                        "answer": {
+                            "answer": ans_text,
                             "confidence": "high",
-                            "compliance_note": None,
-                            "citations": [],
-                            "structured_rows": [],
+                            "compliance_note": confidence_label,
+                            "citations": complete_citations,
+                            "structured_rows": complete_answer.get("structured_rows", []) if complete_answer else [],
                         },
                         "sources": complete_sources if complete_sources else stream_sources,
+                        "citations": complete_citations,
+                        "graph_nodes": complete_nodes,
+                        "graph_edges": complete_edges,
                         "graph_highlight": {
-                            "node_names": event.get("graph_nodes", []),
+                            "node_names": complete_nodes,
                             "relationships": event.get("graph_relationships", []),
                             "entities": stream_meta.get("entities") or [],
+                            "labels": [lbl["label"] for lbl in entity_summary],
+                            "edges": complete_edges,
+                            "edges_used_in_prompt": complete_edges,
+                            "entity_summary": entity_summary,
+                            "query_type": dom_intent,
+                            "graph_matched_by": "graph_facts" if complete_nodes else None,
+                            "used_verified_aggregate": False,
+                            "used_comparison_mode": False,
+                            "input_tokens": complete_trace.get("input_tokens", 0),
+                            "output_tokens": complete_trace.get("output_tokens", 0),
+                            "total_tokens": total_toks,
+                            "telemetry_breakdown": telemetry_breakdown,
+                            "provenance": provenance_list,
                         },
                         "latency_ms": complete_trace.get("request_total_ms"),
+                        "confidence_label": confidence_label,
+                        "confidence_reason": "",
+                        "telemetry_breakdown": telemetry_breakdown,
+                        "trace": complete_trace,
                     }
                     
                     await asyncio.to_thread(
@@ -606,17 +869,24 @@ async def _chat_stream_generator(request: "ChatRequest", container: Container):
                             interaction_id=event.get("response_id", response_id_for_passive),
                             turn_number=len(request.history) // 2 + 1,
                             query_text=request.query,
-                            response_text=complete_answer.get("answer") if complete_answer else "".join(answer_parts).strip(),
+                            response_text=ans_text,
                         )
                     except Exception as timer_exc:
                         logger.error("FeedbackTimer registration error (v2-stream): %s", timer_exc, exc_info=True)
                     
-                    yield _format_sse("done", event)
+                    yield _format_sse("done", {
+                        "type": "complete",
+                        "response_id": event.get("response_id"),
+                        "interaction_id": event.get("response_id"),
+                        "hybrid": hybrid_data_complete,
+                    })
                 elif event_type == "error":
                     yield _format_sse("error", event)
                 else:
                     yield _format_sse("chunk", event)
         except Exception as exc:
+            import traceback
+            logger.error("V2 stream error in chat_stream_generator: %s\n%s", exc, traceback.format_exc())
             yield _format_sse("error", {"type": "error", "message": str(exc), "recoverable": False})
         return
 

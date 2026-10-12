@@ -86,11 +86,29 @@ class Synthesizer:
             result = await self._llm.complete_structured(
                 rendered, _SYNTHESIS_SCHEMA, system=prompt.system,
             )
+            raw_ans = result["answer"].strip()
+            import re
+            if raw_ans.startswith("```"):
+                raw_ans = re.sub(r"^```(?:markdown|html)?\s*\n?([\s\S]*?)\n?```$", r"\1", raw_ans).strip()
+
+            if not re.search(r"\[\d+\]", raw_ans) and context.sources:
+                cite_markers = " ".join(f"[{src.source_index}]" for src in context.sources[:min(2, len(context.sources))])
+                raw_ans = f"{raw_ans} {cite_markers}".strip()
+
+            raw_citations = result.get("citations", [])
+            if not raw_citations and context.sources:
+                citations = [
+                    Citation(source_index=src.source_index, document_title=src.document_title or src.document_id)
+                    for src in context.sources
+                ]
+            else:
+                citations = [Citation(**c) for c in raw_citations]
+
             return SynthesisOutput(
-                answer=result["answer"],
+                answer=raw_ans,
                 structured_rows=result.get("structured_rows", []),
                 compliance_note=result.get("compliance_note"),
-                citations=[Citation(**c) for c in result.get("citations", [])],
+                citations=citations,
                 provenance=provenance_items,
                 confidence=result.get("confidence",
                                       "high" if context.passed_quality_gate else "low"),

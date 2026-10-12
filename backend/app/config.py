@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     log_file: str = "logs/app.log"
     enable_file_logging: bool = True
     cors_origins: str = "http://localhost:3000,http://localhost:5173,http://localhost:8080"
-    query_engine: str = "legacy"                     # "legacy" | "v2" | "shadow" | "canary"
+    query_engine: str = "v2"                         # "legacy" | "v2" | "shadow" | "canary"
     canary_percentage: int = 0                       # 0 to 100 for canary traffic routing
     active_corpus_version: str = "v2_baseline_20260814"
 

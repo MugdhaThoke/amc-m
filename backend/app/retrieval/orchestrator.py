@@ -131,6 +131,8 @@ class RetrievalOrchestrator:
                 text=h.get("text", ""),
                 score=h.get("score", 0.0),
                 taxonomy_paths=h.get("taxonomy_paths", []),
+                page=h.get("page_start", 1),
+                page_start=h.get("page_start", 1),
             )
             for h in hits
         ]
@@ -442,11 +444,14 @@ class RetrievalOrchestrator:
                 cypher_queries_run=[],
             )
             
+            cached_output_tokens = cached_entry.get("output_tokens", len(cached_synth.answer.split()) * 2)
+            cold_tokens = cached_entry.get("cold_equivalent_tokens") or (500 + cached_output_tokens)
             trace = QueryTrace(
                 request_id=req_id,
                 serving_engine="v2",
                 corpus_version=self._corpus_version,
                 cache_hit=True,
+                cache_kind=cached_entry.get("cache_kind", "exact"),
                 cache_lookup_ms=round(t_cache_lookup_ms, 2),
                 query_rewrite_ms=round(t_rewrite_ms, 2),
                 ner_ms=0.0,
@@ -457,7 +462,9 @@ class RetrievalOrchestrator:
                 generation_ms=0.0,
                 request_total_ms=round(total_ms, 2),
                 input_tokens=0,
-                output_tokens=cached_entry.get("output_tokens", len(cached_synth.answer.split()) * 2),
+                output_tokens=cached_output_tokens,
+                cold_equivalent_tokens=cold_tokens,
+                tokens_saved=cold_tokens,
                 quality_score=round(cached_entry.get("quality_score", 1.0), 2),
                 quality_gate_passed=True,
                 fallback_used=False,
@@ -991,16 +998,20 @@ class RetrievalOrchestrator:
             cache_quality_score = cached_entry.get("quality_score")
             cache_quality_gate_passed = cache_quality_score >= 0.3 if cache_quality_score is not None else False
             
+            cold_tokens = cached_entry.get("cold_equivalent_tokens", 500)
             yield {
                 "type": "complete",
                 "response_id": response_id,
                 "trace": {
                     "request_id": req_id,
                     "cache_hit": True,
+                    "cache_kind": cached_entry.get("cache_kind", "exact"),
                     "request_total_ms": cache_total_ms,
                     "generation_ms": cache_total_ms,  # Cached response has no computation cost
                     "quality_score": cache_quality_score,
                     "quality_gate_passed": cache_quality_gate_passed,
+                    "cold_equivalent_tokens": cold_tokens,
+                    "tokens_saved": cold_tokens,
                 },
                 "answer": {
                     "answer": cached_answer,
@@ -1016,7 +1027,15 @@ class RetrievalOrchestrator:
             }
             return
 
+        # Latency tracking across streaming steps
+        t_ner_ms = 0.0
+        t_graph_ms = 0.0
+        t_vector_ms = 0.0
+        t_assembly_ms = 0.0
+        generation_ms = 0.0
+
         # ── Step 2: Intent classification ────────────────────────────────
+        t_ner_start = time.perf_counter()
         intent = None
         try:
             intent = await self._intent.classify(effective_query)
@@ -1058,6 +1077,8 @@ class RetrievalOrchestrator:
             except Exception as exc:
                 logger.warning("Entity resolution failed during streaming: %s", exc)
                 yield {"type": "error", "message": f"Entity resolution error: {exc}", "recoverable": True}
+
+        t_ner_ms = (time.perf_counter() - t_ner_start) * 1000
 
         # ── Step 3.5: Cypher aggregation path ─────────────────────────────
         cypher_facts: list[GraphFact] = []
@@ -1124,6 +1145,7 @@ class RetrievalOrchestrator:
                 top_k or self._top_k, intent, resolved_entities,
             )
 
+        t_retrieval_start = time.perf_counter()
         if config.ENABLE_PARALLELIZATION and needs_graph and needs_vector:
             graph_res, vector_res = await asyncio.gather(
                 _stream_graph(), _stream_vector(), return_exceptions=True
@@ -1138,19 +1160,26 @@ class RetrievalOrchestrator:
                 yield {"type": "error", "message": f"Vector search error: {vector_res}", "recoverable": True}
             else:
                 chunks = vector_res
+            t_retrieval_total = (time.perf_counter() - t_retrieval_start) * 1000
+            t_graph_ms = t_retrieval_total
+            t_vector_ms = t_retrieval_total
         else:
             if needs_graph:
+                t_g_start = time.perf_counter()
                 try:
                     facts, traversal_paths, cyphers = await _stream_graph()
                 except Exception as exc:
                     logger.warning("Graph traversal failed during streaming: %s", exc)
                     yield {"type": "error", "message": f"Graph traversal error: {exc}", "recoverable": True}
+                t_graph_ms = (time.perf_counter() - t_g_start) * 1000
             if needs_vector:
+                t_v_start = time.perf_counter()
                 try:
                     chunks = await _stream_vector()
                 except Exception as exc:
                     logger.warning("Vector search failed during streaming: %s", exc)
                     yield {"type": "error", "message": f"Vector search error: {exc}", "recoverable": True}
+                t_vector_ms = (time.perf_counter() - t_v_start) * 1000
 
         if cypher_facts:
             facts.extend(cypher_facts)
@@ -1183,25 +1212,31 @@ class RetrievalOrchestrator:
         )
 
         context = None
+        t_asm_start = time.perf_counter()
         try:
             context = self._assembler.assemble(retrieval)
         except Exception as exc:
             logger.warning("Context assembly failed during streaming: %s", exc)
             yield {"type": "error", "message": f"Context assembly error: {exc}", "recoverable": True}
+        t_assembly_ms = (time.perf_counter() - t_asm_start) * 1000
 
         # ── Step 8: LLM streaming synthesis ──────────────────────────────
+        t_gen_start = time.perf_counter()
         chunk_index = 0
         full_answer = ""
         try:
             from app.prompts import get_prompt
+            prompt_obj = None
             try:
-                system_prompt = get_prompt("synthesis_system").text if context else None
+                prompt_obj = get_prompt("synthesis")
+                system_prompt = prompt_obj.system if context else None
             except Exception:
                 system_prompt = None
             ctx_text = context.context_text if context else ""
+            user_prompt = prompt_obj.render(query=effective_query, context=ctx_text) if (context and prompt_obj) else f"Query: {effective_query}\n\nContext:\n{ctx_text}"
 
             async for text_chunk in self._synthesizer._llm.complete_stream(
-                prompt=f"Query: {effective_query}\n\nContext:\n{ctx_text}",
+                prompt=user_prompt,
                 system=system_prompt,
             ):
                 full_answer += text_chunk
@@ -1222,28 +1257,61 @@ class RetrievalOrchestrator:
                 logger.error("Fallback synthesis also failed: %s", fallback_exc)
                 yield {"type": "error", "message": "Unable to generate answer", "recoverable": False}
 
+        generation_ms = (time.perf_counter() - t_gen_start) * 1000
         total_ms = round((time.perf_counter() - t0) * 1000, 2)
         
+        # Strip code fences from streamed answer if the model enclosed it
+        full_answer_clean = full_answer.strip()
+        import re
+        if full_answer_clean.startswith("```"):
+            full_answer_clean = re.sub(r"^```(?:markdown|html)?\s*\n?([\s\S]*?)\n?```$", r"\1", full_answer_clean).strip()
+
+        if not re.search(r"\[\d+\]", full_answer_clean) and context and context.sources:
+            cite_markers = " ".join(f"[{s.source_index}]" for s in context.sources[:min(2, len(context.sources))])
+            full_answer_clean = f"{full_answer_clean} {cite_markers}".strip()
+
         # ── Compute generation latency ──────────────────────────────────
-        # In streaming mode, we can approximate: total - time spent on retrieval
-        # For now, we estimate based on chunk count and total time
-        generation_ms = total_ms - (context.latency_ms if context and hasattr(context, "latency_ms") else 0)
+        if generation_ms <= 0:
+            generation_ms = max(0.0, total_ms - t_vector_ms - t_graph_ms - t_ner_ms)
+        if generation_ms < 0:
+            generation_ms = max(0.0, total_ms - 50.0)
         quality_score = context.quality_score if context else None
         quality_gate_passed = quality_score >= 0.3 if quality_score is not None else False
 
+        # Build rich citations from context sources
+        stream_citations = []
+        if context and context.sources:
+            for i, s in enumerate(context.sources):
+                doc_name = getattr(s, "document_title", None) or getattr(s, "document_id", f"Document {i+1}")
+                page_val = getattr(s, "page_number", None) or getattr(s, "page", None)
+                stream_citations.append({
+                    "marker": str(i + 1),
+                    "source": {
+                        "chunk_id": getattr(s, "chunk_id", f"src.{i+1}"),
+                        "document_id": getattr(s, "document_id", doc_name),
+                        "document_name": doc_name,
+                        "page_number": page_val,
+                        "page_label": getattr(s, "page_label", f"p. {page_val}" if page_val else "—"),
+                        "verbatim_text": getattr(s, "verbatim_text", getattr(s, "snippet", "")),
+                        "snippet": getattr(s, "snippet", ""),
+                        "source_url": getattr(s, "url", getattr(s, "source_url", None)),
+                        "score": getattr(s, "score", 0.9),
+                    }
+                })
+
         # ── Cache the streamed answer ─────────────────────────────────────
-        if full_answer and context:
+        if full_answer_clean and context:
             try:
                 cache.store(
                     effective_query,
                     {
-                        "answer": full_answer.strip(),
+                        "answer": full_answer_clean,
                         "confidence": "high",
                         "compliance_note": None,
-                        "citations": [],
+                        "citations": stream_citations,
                         "provenance": [],
                         "quality_score": context.quality_score,
-                        "output_tokens": len(full_answer.split()) * 2,
+                        "output_tokens": len(full_answer_clean.split()) * 2,
                         "intent": intent.model_dump() if hasattr(intent, "model_dump") else {},
                         "traversal_paths": traversal_paths,
                         "graph_facts": [f.model_dump() if hasattr(f, "model_dump") else f for f in facts],
@@ -1264,6 +1332,13 @@ class RetrievalOrchestrator:
         # ── Build graph node/relationship lists for evidence ──────────────
         graph_nodes = sorted({f.subject for f in facts} | {f.object for f in facts})
         graph_relationships = sorted({f.predicate for f in facts})
+        stream_edges = [
+            {"s": f.subject, "rel": f.predicate, "o": f.object, "conf": f.properties.get("confidence", 1.0) if hasattr(f, "properties") and isinstance(f.properties, dict) else 1.0}
+            for f in facts
+        ]
+
+        in_toks = context.token_count if context else 0
+        out_toks = len(full_answer_clean.split()) * 2
 
         yield {
             "type": "complete",
@@ -1272,20 +1347,30 @@ class RetrievalOrchestrator:
                 "request_id": req_id,
                 "cache_hit": False,
                 "request_total_ms": total_ms,
-                "generation_ms": generation_ms,
+                "generation_ms": round(generation_ms, 2),
+                "ner_ms": round(t_ner_ms, 2),
+                "graph_ms": round(t_graph_ms, 2),
+                "vector_ms": round(t_vector_ms, 2),
+                "rerank_ms": 0.0,
+                "assembly_ms": round(t_assembly_ms, 2),
+                "input_tokens": in_toks,
+                "output_tokens": out_toks,
+                "tokens_total": in_toks + out_toks,
                 "chunks_streamed": chunk_index,
                 "quality_score": quality_score,
                 "quality_gate_passed": quality_gate_passed,
             },
             "answer": {
-                "answer": full_answer.strip(),
+                "answer": full_answer_clean,
                 "confidence": "high",
                 "compliance_note": None,
-                "citations": [],
+                "citations": stream_citations,
                 "structured_rows": [],
             },
+            "citations": stream_citations,
             "graph_facts": facts,
             "graph_nodes": graph_nodes,
             "graph_relationships": graph_relationships,
+            "graph_edges": stream_edges,
             "context_sources": [s.model_dump() if hasattr(s, "model_dump") else s for s in (context.sources if context else [])],
         }

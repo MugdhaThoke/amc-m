@@ -70,11 +70,58 @@ class VectorStore:
                 self._payloads = {int(k): v for k, v in json.load(f).items()}
             self._next_id = (max(self._payloads) + 1) if self._payloads else 0
             logger.info("Loaded FAISS index (%d vectors) from %s", self._index.ntotal, self._dir)
-        else:
-            self._index = self._new_index()
-            self._payloads = {}
-            self._next_id = 0
-            logger.info("Initialized empty FAISS index at %s", self._dir)
+
+        # Auto-hydrate from amc_master baseline if index is empty or unpopulated
+        if self._index is None or self._index.ntotal == 0 or len(self._payloads) == 0:
+            from pathlib import Path
+            import pickle
+            base_engine_dir = Path(__file__).resolve().parent.parent / "engine" / "faiss_indexes" / "amc_master"
+            master_faiss = base_engine_dir / "index.faiss"
+            master_pkl = base_engine_dir / "index.pkl"
+            if master_faiss.exists() and master_pkl.exists():
+                try:
+                    logger.info("Auto-hydrating VectorStore from amc_master baseline (%s)", base_engine_dir)
+                    self._index = faiss.read_index(str(master_faiss))
+                    with open(master_pkl, "rb") as f:
+                        master_data = pickle.load(f)
+                    children = master_data.get("children", [])
+                    parents = master_data.get("parents", {})
+                    self._payloads = {}
+                    for idx, child in enumerate(children):
+                        if isinstance(child, dict):
+                            parent_id = child.get("parent_id", f"p_{idx}")
+                            parent = parents.get(parent_id, {})
+                            parent_text = parent.get("text", child.get("text", ""))
+                            src_name = child.get("source") or child.get("product_name") or f"doc_{idx}"
+                            page_num = child.get("page_num", 1)
+                            self._payloads[idx] = {
+                                "chunk_id": child.get("child_id", f"c_{idx}"),
+                                "document_id": src_name,
+                                "document_title": src_name,
+                                "source_filename": src_name,
+                                "page_start": page_num,
+                                "page_end": page_num,
+                                "section_locator": f"p.{page_num}:{parent_id}",
+                                "corpus_version": self._corpus_version,
+                                "legacy_parent_id": parent_id,
+                                "text": parent_text or child.get("text", ""),
+                                "order": idx,
+                                "taxonomy_paths": [],
+                                "entity_ids": [],
+                            }
+                    self._next_id = len(self._payloads)
+                    self._persist()
+                    logger.info("Successfully hydrated VectorStore with %d vectors from amc_master", self._index.ntotal)
+                except Exception as exc:
+                    logger.warning("Failed to auto-hydrate VectorStore from amc_master: %s", exc)
+                    self._index = self._new_index()
+                    self._payloads = {}
+                    self._next_id = 0
+            else:
+                self._index = self._new_index()
+                self._payloads = {}
+                self._next_id = 0
+                logger.info("Initialized empty FAISS index at %s", self._dir)
 
     def _persist(self) -> None:
         os.makedirs(self._dir, exist_ok=True)

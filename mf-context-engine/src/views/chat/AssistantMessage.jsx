@@ -100,6 +100,7 @@ export default function AssistantMessage({
                 actorId,
                 actorRole,
                 isCurrentTurn,
+                pendingFeedbackNotice: r.pending_feedback_notice,
               })
             }
             title={isCurrentTurn ? "Rate or flag issues with this response" : "Feedback is only available on the latest response"}

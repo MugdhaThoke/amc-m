@@ -12,6 +12,7 @@ If cosine similarity >= sim_threshold (default 0.95), returns cached answer in <
 bypassing Neo4j traversal and LLM generation.
 Supports both orchestrator lookup() and engine check() APIs, pre-warming, TTL, and corpus invalidation.
 """
+import hashlib
 import logging
 import time
 from typing import Any, Optional, Tuple
@@ -39,11 +40,18 @@ class SemanticQueryCache:
         # Normalized vectors kept alongside entries so clear_expired() can rebuild
         # the FAISS index without paying to re-embed every surviving query.
         self._vectors: list[np.ndarray] = []
+        # In-memory exact string hash index: MD5 fingerprint -> cache_data index (<1ms Gate 1)
+        self._exact_hash_index: dict[str, int] = {}
         try:
             from fastembed import TextEmbedding
             self._embedder = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
         except Exception:
             self._embedder = None
+
+    @staticmethod
+    def _fingerprint(query: str) -> str:
+        """Normalized string MD5 fingerprint for O(1) exact cache probe."""
+        return hashlib.md5(query.strip().lower().encode("utf-8")).hexdigest()
 
     def count(self) -> int:
         return self._index.ntotal
@@ -71,7 +79,37 @@ class SemanticQueryCache:
         embedder: Any = None,
         corpus_version: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
-        """Look up query. Returns cached result dict if cosine similarity >= threshold and not expired."""
+        """Look up query. Returns cached result dict if exact hit or cosine similarity >= threshold and not expired.
+
+        Dual-Gate Caching Strategy:
+        - Gate 1: O(1) MD5 exact string fingerprint match (<1ms, bypasses FastEmbed model)
+        - Gate 2: FAISS vector similarity search (~20ms, for semantically related paraphrases)
+        """
+        # --- Gate 1: Exact string fingerprint probe (<1ms) ---
+        if isinstance(query, str) and query.strip():
+            fp = self._fingerprint(query)
+            if fp in self._exact_hash_index:
+                idx = self._exact_hash_index[fp]
+                if idx < len(self._cache_data):
+                    hit_data = self._cache_data[idx].copy()
+                    age = time.time() - hit_data.get("timestamp", 0)
+                    valid = True
+                    if age > self._ttl_seconds:
+                        logger.debug("Fingerprint cache entry expired (age: %.1fs > ttl: %ds)", age, self._ttl_seconds)
+                        valid = False
+                    if corpus_version and hit_data.get("corpus_version") and hit_data.get("corpus_version") != corpus_version:
+                        logger.debug("Fingerprint cache corpus mismatch (%s vs %s)", hit_data.get("corpus_version"), corpus_version)
+                        valid = False
+
+                    if valid:
+                        logger.info("Exact fingerprint cache HIT (<1ms, fp=%s, age: %.1fs)", fp[:8], age)
+                        hit_data["cache_hit"] = True
+                        hit_data["cache_similarity"] = 1.0
+                        hit_data["cache_kind"] = "exact"
+                        hit_data["hit_type"] = "Fingerprint"
+                        return hit_data
+
+        # --- Gate 2: FAISS cosine vector search ---
         if self._index.ntotal == 0:
             return None
 
@@ -100,6 +138,8 @@ class SemanticQueryCache:
                 logger.info("Semantic cache HIT (similarity: %.4f, age: %.1fs)", score, age)
                 hit_data["cache_hit"] = True
                 hit_data["cache_similarity"] = score
+                hit_data["cache_kind"] = "semantic"
+                hit_data["hit_type"] = "Semantic"
                 return hit_data
 
             logger.debug("Semantic cache MISS (best similarity: %.4f)", score if idx != -1 else 0.0)
@@ -143,7 +183,11 @@ class SemanticQueryCache:
                 "prompt_version": prompt_version,
                 **response,
             }
+            new_idx = len(self._cache_data)
             self._cache_data.append(entry)
+            if isinstance(query, str) and query.strip():
+                fp = self._fingerprint(query)
+                self._exact_hash_index[fp] = new_idx
             logger.info("Stored response in semantic cache (total entries: %d)", self._index.ntotal)
         except Exception as exc:
             logger.warning("Cache store error: %s", exc)
@@ -209,6 +253,11 @@ class SemanticQueryCache:
         self._index.reset()
         self._cache_data = survivors
         self._vectors = survivor_vectors
+        self._exact_hash_index = {
+            self._fingerprint(entry["query"]): idx
+            for idx, entry in enumerate(survivors)
+            if entry.get("query") and isinstance(entry["query"], str)
+        }
         for vec in survivor_vectors:
             self._index.add(vec)
 
@@ -219,6 +268,7 @@ class SemanticQueryCache:
         self._index.reset()
         self._cache_data.clear()
         self._vectors.clear()
+        self._exact_hash_index.clear()
         logger.info("Cleared semantic query cache.")
 
 

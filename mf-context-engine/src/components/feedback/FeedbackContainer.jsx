@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from "react";
-import { CheckCircle2, AlertTriangle } from "lucide-react";
+import { CheckCircle2, AlertTriangle, AlertCircle } from "lucide-react";
 import FailureCheckboxGrid from "./FailureCheckboxGrid";
 import FeedbackInputRow from "./FeedbackInputRow";
-import { submitFeedback } from "../../services/api";
+import { submitFeedback, fetchPendingFeedbackNotice } from "../../services/api";
 import { useAppState } from "../../state/AppState";
 
 /**
@@ -20,6 +20,7 @@ export default function FeedbackContainer({
   actorId,
   actorRole,
   isCurrentTurn = true,
+  pendingFeedbackNotice = null,
 }) {
   const { activeUser } = useAppState();
 
@@ -32,6 +33,33 @@ export default function FeedbackContainer({
   const [feedbackId, setFeedbackId] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
   const [lastSubmittedAt, setLastSubmittedAt] = useState(null);
+  const [notice, setNotice] = useState(pendingFeedbackNotice);
+
+  useEffect(() => {
+    if (pendingFeedbackNotice !== undefined && pendingFeedbackNotice !== null) {
+      setNotice(pendingFeedbackNotice);
+      return;
+    }
+    if (!query) {
+      setNotice(null);
+      return;
+    }
+    let active = true;
+    fetchPendingFeedbackNotice({
+      query,
+      sessionId: sessionId || undefined,
+      actorId: effectiveActorId || undefined,
+    })
+      .then((res) => {
+        if (active) setNotice(res);
+      })
+      .catch(() => {
+        if (active) setNotice(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [pendingFeedbackNotice, query, sessionId, effectiveActorId]);
 
   // Reset form when switching response_id
   useEffect(() => {
@@ -109,6 +137,63 @@ export default function FeedbackContainer({
             : "Feedback review is only active on the latest response. This previous turn is locked."}
         </div>
       </div>
+
+      {notice?.has_pending_feedback && (
+        <div className="cg-pending-feedback-banner" role="status">
+          <div className="cg-pending-feedback-banner-header">
+            <div className="cg-pending-feedback-banner-icon">
+              <AlertCircle size={16} />
+            </div>
+            <div className="cg-pending-feedback-banner-content">
+              <div className="cg-pending-feedback-title">
+                Similar Feedback Already Submitted
+                {notice.match_count && notice.match_count > 1 ? (
+                  <span className="cg-pending-feedback-badge">
+                    {notice.match_count} reports
+                  </span>
+                ) : null}
+              </div>
+              <div className="cg-pending-feedback-message">
+                Another user has previously submitted feedback on a similar query. Repair is currently{" "}
+                <span className="cg-pending-feedback-status-pill">{notice.repair_lifecycle_status || "open"}</span>.
+              </div>
+              <div className="cg-pending-feedback-note">
+                You can still submit additional feedback below if needed.
+              </div>
+
+              <details className="cg-pending-feedback-details">
+                <summary>View Match Details</summary>
+                <div className="cg-pending-feedback-details-content">
+                  {notice.similarity_score != null && (
+                    <div>
+                      <span>Semantic match:</span>{" "}
+                      <strong>{(notice.similarity_score * 100).toFixed(1)}%</strong>
+                    </div>
+                  )}
+                  {Array.isArray(notice.feedback_categories) && notice.feedback_categories.length > 0 && (
+                    <div>
+                      <span>Reported categories:</span>{" "}
+                      <strong>{notice.feedback_categories.join(", ")}</strong>
+                    </div>
+                  )}
+                  {notice.feedback_submitted_at && (
+                    <div>
+                      <span>Submitted at:</span>{" "}
+                      <span>{new Date(notice.feedback_submitted_at).toLocaleString()}</span>
+                    </div>
+                  )}
+                  {notice.original_query_text && (
+                    <div>
+                      <span>Matched query:</span>{" "}
+                      <code>{notice.original_query_text}</code>
+                    </div>
+                  )}
+                </div>
+              </details>
+            </div>
+          </div>
+        </div>
+      )}
 
       {isCurrentTurn && selectedCodes.size > 0 && (
         <div className="cg-feedback-selection">

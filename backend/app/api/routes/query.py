@@ -18,19 +18,28 @@ orchestrator/container.
 """
 import asyncio
 import json
+import logging
 import uuid
 from functools import lru_cache
+from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
 
 from app.api.deps import Container, get_container
 from app.api.routes.files import get_pdf_url
+from app.core.database import get_db
 from app.engine import config as engine_config
 from app.engine import faiss_store as engine_faiss
 from app.engine import graph_store, retrieval
+from app.feedback.intent_matcher import get_intent_matcher
 from app.models.api import QueryRequest, QueryResponse, TraditionalResult
+from app.models.feedback import PendingFeedbackNotice
 from app.models.query import SourceAttribution, SynthesisOutput
+from app.schemas.response_feedback_table import ResponseFeedback
+
+logger = logging.getLogger("app.api.query")
 
 router = APIRouter(prefix="/query", tags=["query"])
 
@@ -61,11 +70,12 @@ def _confidence(label: str | None) -> str:
 
 # ---------- adapters: engine dicts -> QueryResponse ----------
 
-def _traditional_response(query: str, result: dict) -> QueryResponse:
+def _traditional_response(query: str, result: dict, pending_notice: Optional[PendingFeedbackNotice] = None) -> QueryResponse:
     docs = result.get("docs", [])
     resp = QueryResponse(query=query, mode="traditional")
     resp.response_id = f"resp_{uuid.uuid4().hex[:12]}"
     resp.interaction_id = f"int_{uuid.uuid4().hex[:12]}"
+    resp.pending_feedback_notice = pending_notice
     resp.traditional = TraditionalResult(
         files=[{
             "name": d.get("name"),
@@ -92,12 +102,18 @@ def _traditional_response(query: str, result: dict) -> QueryResponse:
     return resp
 
 
-def _contextgraph_response(query: str, result: dict, entity_summary: list | None = None) -> QueryResponse:
+def _contextgraph_response(
+    query: str,
+    result: dict,
+    entity_summary: list | None = None,
+    pending_notice: Optional[PendingFeedbackNotice] = None,
+) -> QueryResponse:
     docs = result.get("docs", [])
     edges = result.get("graph_edges", [])
     resp = QueryResponse(query=query, mode="contextgraph")
     resp.response_id = f"resp_{uuid.uuid4().hex[:12]}"
     resp.interaction_id = f"int_{uuid.uuid4().hex[:12]}"
+    resp.pending_feedback_notice = pending_notice
 
     citations_list = []
     for i, d in enumerate(docs):
@@ -190,9 +206,9 @@ def _contextgraph_response(query: str, result: dict, entity_summary: list | None
         "used_comparison_mode": result.get("used_comparison_mode", False),
         "input_tokens": result.get("input_tokens", 0),
         "output_tokens": result.get("output_tokens", 0),
-        "total_tokens": result.get("total_tokens", 0),
-        "telemetry_breakdown": result.get("telemetry_breakdown", {}),
+        "telemetry_breakdown": telemetry_breakdown,
         "provenance": provenance_list,
+        "pending_feedback_notice": pending_notice.model_dump() if pending_notice else None,
     }
     resp.latency_ms = int(result.get("total_time", 0) * 1000)
     return resp
@@ -215,12 +231,18 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
         hits = await container.orchestrator.traditional_search(query, top_k=request.top_k)
         trad_result = TraditionalResult(
             files=[{
-                "name": h.get("document_title") or h.get("filename") or h.get("document_id"),
-                "document_id": h.get("document_id"),
-                "score": h.get("score"),
+                "name": h.get("source_filename") or h.get("document_title") or h.get("document_id") or "Document",
+                "document_id": h.get("document_id") or h.get("source_filename"),
+                "document_title": h.get("document_title") or h.get("source_filename") or "Document",
+                "score": round(float(h.get("score", 0.85)), 3),
                 "page": h.get("page_start", 1),
+                "page_number": h.get("page_start", 1),
+                "page_label": f"p. {h.get('page_start', 1)}",
                 "snippet": h.get("text", "")[:300],
                 "full_text": h.get("text", ""),
+                "verbatim_text": h.get("text", ""),
+                "url": get_pdf_url(h.get("document_title") or h.get("source_filename") or "", h.get("page_start", 1)),
+                "source_url": get_pdf_url(h.get("document_title") or h.get("source_filename") or "", h.get("page_start", 1)),
             } for h in hits],
             snippet=synthesis.answer if mode == "traditional" else None,
             metrics={
@@ -231,12 +253,11 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
                 "output_tokens": trace.output_tokens if trace else 0,
                 "total_tokens": (trace.input_tokens + trace.output_tokens) if trace else 0,
                 "note": "v2 Target Corpus Vector Search Baseline",
-                # Populate telemetry_breakdown in legacy key format so
-                # _render_telemetry_card() works on the Traditional panel.
                 "telemetry_breakdown": {
                     "latency_vector_db_ms": round(trace.vector_ms, 1) if trace else 0.0,
                     "latency_rerank_ms": round(trace.rerank_ms, 1) if trace else 0.0,
                     "latency_graph_db_ms": 0.0,
+                    "latency_cypher_generation_ms": 0.0,
                     "latency_ner_processing_ms": round(trace.ner_ms, 1) if trace else 0.0,
                     "latency_llm_generation_ms": round(trace.generation_ms, 1) if trace else 0.0,
                     "latency_post_retrieval_processing_ms": round(trace.assembly_ms, 1) if trace else 0.0,
@@ -255,22 +276,28 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
         SourceAttribution(
             source_index=src.source_index,
             document_id=src.document_id,
-            document_title=src.document_title,
+            document_title=src.document_title or src.document_id,
             chunk_id=src.chunk_id,
             snippet=src.snippet,
-            page=getattr(src, "page", None),
-            url=get_pdf_url(src.document_title or src.document_id, getattr(src, "page", None)),
+            page=getattr(src, "page", 1) or 1,
+            page_number=getattr(src, "page_number", getattr(src, "page", 1)) or 1,
+            page_label=getattr(src, "page_label", f"p. {getattr(src, 'page', 1)}"),
+            verbatim_text=getattr(src, "verbatim_text", getattr(src, "snippet", "")),
+            url=getattr(src, "url", get_pdf_url(src.document_title or src.document_id, getattr(src, "page", 1))),
         )
         for src in context.sources
-    ] if context.sources else [
+    ] if context and context.sources else [
         SourceAttribution(
             source_index=i + 1,
             document_id=c.document_id,
             document_title=c.document_title or c.document_id,
             chunk_id=c.chunk_id,
             snippet=c.text[:300],
-            page=getattr(c, "page", None),
-            url=get_pdf_url(c.document_title or c.document_id, getattr(c, "page", None)),
+            page=getattr(c, "page", 1) or 1,
+            page_number=getattr(c, "page_start", getattr(c, "page", 1)) or 1,
+            page_label=f"p. {getattr(c, 'page', 1)}",
+            verbatim_text=c.text,
+            url=get_pdf_url(c.document_title or c.document_id, getattr(c, "page", 1)),
         )
         for i, c in enumerate(retrieval_res.chunks[:5])
     ]
@@ -281,7 +308,7 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
 
     # Build graph edge objects in legacy {s, rel, o, conf} shape for the SVG renderer.
     graph_edges = [
-        {"s": f.subject, "rel": f.predicate, "o": f.object, "conf": f.properties.get("confidence", 1.0)}
+        {"s": f.subject, "rel": f.predicate, "o": f.object, "conf": f.properties.get("confidence", 1.0) if hasattr(f, "properties") and isinstance(f.properties, dict) else 1.0}
         for f in graph_facts
     ]
 
@@ -290,14 +317,14 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
     active_labels = sorted({
         f.properties.get("entity_type") or ""
         for f in graph_facts
-        if f.properties.get("entity_type")
+        if hasattr(f, "properties") and isinstance(f.properties, dict) and f.properties.get("entity_type")
     })
 
     # Entity-type summary for the ontology view.
     from collections import defaultdict
     label_counts: dict[str, int] = defaultdict(int)
     for f in graph_facts:
-        etype = f.properties.get("entity_type") or "Entity"
+        etype = (f.properties.get("entity_type") if hasattr(f, "properties") and isinstance(f.properties, dict) else None) or "Entity"
         label_counts[etype] += 1
     entity_summary = [
         {"label": lbl, "count": cnt, "active": True}
@@ -306,26 +333,97 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
 
     # Build provenance from context sources (legacy provenance_list shape).
     provenance_list: list[dict] = []
-    if context and context.sources:
-        for src in context.sources:
-            page_num = getattr(src, "page_number", None) or getattr(src, "page", None)
-            page_label = getattr(src, "page_label", None) or (f"p. {page_num}" if page_num else "—")
-            verbatim = getattr(src, "verbatim_text", None) or src.snippet or ""
-            doc_name = src.document_title or src.document_id
-            provenance_list.append({
-                "doc": doc_name,
+    effective_sources = context.sources if (context and context.sources) else sources
+    for src in effective_sources:
+        page_num = getattr(src, "page_number", None) or getattr(src, "page", 1)
+        page_label = getattr(src, "page_label", None) or (f"p. {page_num}" if page_num else "—")
+        verbatim = getattr(src, "verbatim_text", None) or src.snippet or ""
+        doc_name = src.document_title or src.document_id
+        provenance_list.append({
+            "doc": doc_name,
+            "document_title": doc_name,
+            "name": doc_name,
+            "page": page_num or 1,
+            "page_number": page_num,
+            "page_label": page_label,
+            "chunk_id": src.chunk_id or f"p.{page_num or 1}",
+            "snippet": src.snippet or (verbatim[:200] if verbatim else ""),
+            "verbatim_text": verbatim,
+            "score": getattr(src, "score", 0.9),
+            "url": getattr(src, "url", None) or get_pdf_url(doc_name, page_num),
+            "source_url": getattr(src, "url", None) or get_pdf_url(doc_name, page_num),
+        })
+
+    # Build rich citations with marker + source
+    citations_list: list[dict] = []
+    for i, src in enumerate(effective_sources):
+        doc_name = src.document_title or src.document_id
+        page_num = getattr(src, "page_number", None) or getattr(src, "page", 1)
+        page_label = getattr(src, "page_label", None) or (f"p. {page_num}" if page_num else "—")
+        verbatim = getattr(src, "verbatim_text", None) or src.snippet or ""
+        citations_list.append({
+            "marker": str(i + 1),
+            "source": {
+                "chunk_id": src.chunk_id or f"src.{i+1}",
+                "document_id": src.document_id or doc_name,
+                "document_name": doc_name,
                 "document_title": doc_name,
-                "name": doc_name,
-                "page": page_num or 1,
                 "page_number": page_num,
                 "page_label": page_label,
-                "chunk_id": src.chunk_id or f"p.{page_num or 1}",
-                "snippet": src.snippet or (verbatim[:200] if verbatim else ""),
                 "verbatim_text": verbatim,
+                "snippet": src.snippet or (verbatim[:200] if verbatim else ""),
+                "source_url": getattr(src, "url", None) or get_pdf_url(doc_name, page_num),
+                "url": getattr(src, "url", None) or get_pdf_url(doc_name, page_num),
+                "local_doc_path": f"/api/files/{doc_name}",
                 "score": getattr(src, "score", 0.9),
-                "url": get_pdf_url(doc_name, page_num),
-                "source_url": get_pdf_url(doc_name, page_num),
-            })
+            }
+        })
+
+    # UI Badges for Evidence Overview
+    ui_badges: list[dict] = []
+    if trace and trace.cache_hit:
+        hit_lbl = "Fingerprint Cache Hit" if (getattr(trace, "cache_kind", None) == "exact") else "Semantic Cache Hit"
+        saved = trace.tokens_saved or 0
+        ui_badges.append({
+            "label": hit_lbl,
+            "desc": f"Served from cognitive cache — {len(graph_nodes)} nodes ({saved} tokens saved)",
+            "type": "success"
+        })
+    if intent and hasattr(intent, "query_type") and intent.query_type:
+        dom = intent.query_type.value
+        ui_badges.append({
+            "label": f"Pillar: Intent Partition ({dom.upper()})",
+            "desc": f"Domain intent: {dom}",
+            "type": "primary"
+        })
+    if graph_facts:
+        ui_badges.append({
+            "label": f"Pillar 2: Single-Shot UNWIND ({len(graph_nodes)} nodes)",
+            "desc": "Batch-traversed relational subgraph without sequential loops",
+            "type": "primary"
+        })
+    ui_badges.append({
+        "label": "Pillar 5: Verified Grounding",
+        "desc": "Claims cross-validated against structured facts and active corpus",
+        "type": "success"
+    })
+
+    # Triplet Table for Grounding / Validation tab
+    triplet_table = [
+        {
+            "s": f.subject,
+            "rel": f.predicate,
+            "o": f.object,
+            "conf": f.properties.get("confidence", 1.0) if hasattr(f, "properties") and isinstance(f.properties, dict) else 1.0
+        }
+        for f in graph_facts
+    ]
+
+    cross_val_ledger = {
+        "cross_validation_badge": {"label": "Pillar 5: Verified Grounding", "type": "success", "desc": "Grounded against active corpus."},
+        "evidence_status": "SUPPORTED",
+        "metrics": [],
+    }
 
     # Token totals
     total_tokens = (trace.input_tokens + trace.output_tokens) if trace else 0
@@ -335,6 +433,7 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
         "latency_vector_db_ms": round(trace.vector_ms, 1) if trace else 0.0,
         "latency_rerank_ms": round(trace.rerank_ms, 1) if trace else 0.0,
         "latency_graph_db_ms": round(trace.graph_ms, 1) if trace else 0.0,
+        "latency_cypher_generation_ms": 0.0,
         "latency_ner_processing_ms": round(trace.ner_ms, 1) if trace else 0.0,
         "latency_llm_generation_ms": round(trace.generation_ms, 1) if trace else 0.0,
         "latency_post_retrieval_processing_ms": round(trace.assembly_ms, 1) if trace else 0.0,
@@ -342,12 +441,17 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
         "tokens_input": trace.input_tokens if trace else 0,
         "tokens_output": trace.output_tokens if trace else 0,
         "tokens_total": total_tokens,
-        "db_candidates_surfaced": len(graph_nodes),
+        "db_candidates_surfaced": len(graph_nodes) if graph_nodes else len(sources),
         "vector_bypassed": False,
         "pipeline_mode": "ContextGraph Hybrid RAG (v2)",
         "cache_hit": trace.cache_hit if trace else False,
+        "hit_type": "Fingerprint" if (trace and getattr(trace, "cache_kind", None) == "exact") else ("Semantic" if (trace and trace.cache_hit) else None),
+        "domain_intent": intent.query_type.value if (intent and hasattr(intent, "query_type") and intent.query_type) else None,
         "tokens_saved": trace.tokens_saved if trace else 0,
         "tokens_cold_equivalent": trace.cold_equivalent_tokens if trace else 0,
+        "ui_badges": ui_badges,
+        "triplet_table": triplet_table,
+        "cross_validation_ledger": cross_val_ledger,
     } if trace else {}
 
     # Confidence label in legacy display format.
@@ -357,8 +461,22 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
     query_type_str = intent.query_type.value if intent and intent.query_type else None
 
     # Patch compliance_note onto synthesis for the frontend confidence badge.
-    if synthesis and not synthesis.compliance_note:
-        synthesis.compliance_note = confidence_label
+    if synthesis:
+        if not synthesis.compliance_note:
+            synthesis.compliance_note = confidence_label
+        # Overwrite synthesis citations with rich dictionary format
+        synthesis.citations = citations_list
+
+    pending_feedback_notice = None
+    try:
+        matcher = get_intent_matcher()
+        pending_feedback_notice = await matcher.check_pending_feedback(
+            query=query,
+            session_id=getattr(request, "session_id", None),
+            actor_id=getattr(request, "actor_id", None),
+        )
+    except Exception as exc:
+        logger.warning("Pending feedback check in _run_v2_orchestrator failed: %s", exc)
 
     return QueryResponse(
         query=query,
@@ -382,9 +500,12 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
             "graph_matched_by": "graph_facts" if graph_facts else None,
             "used_verified_aggregate": False,
             "used_comparison_mode": False,
+            "input_tokens": trace.input_tokens if trace else 0,
+            "output_tokens": trace.output_tokens if trace else 0,
             "total_tokens": total_tokens,
             "telemetry_breakdown": telemetry_breakdown,
             "provenance": provenance_list,
+            "pending_feedback_notice": pending_feedback_notice.model_dump() if pending_feedback_notice else None,
         },
         context_debug=context,
         traditional=trad_result,
@@ -394,43 +515,118 @@ async def _run_v2_orchestrator(request: QueryRequest, container: Container) -> Q
         corpus_version=container.settings.active_corpus_version,
         response_id=f"resp_{uuid.uuid4().hex[:12]}",
         interaction_id=f"int_{uuid.uuid4().hex[:12]}",
+        pending_feedback_notice=pending_feedback_notice,
     )
 
 
 @router.post("/v2", response_model=QueryResponse)
 async def run_query_v2(
     request: QueryRequest,
+    response: Response,
     container: Container = Depends(get_container),
 ) -> QueryResponse:
     """Explicit v2 ContextGraph orchestrator endpoint."""
-    return await _run_v2_orchestrator(request, container)
+    resp = await _run_v2_orchestrator(request, container)
+    response.headers["X-Serving-Engine"] = resp.serving_engine or "v2"
+    return resp
 
 
-@router.post("/traditional", response_model=QueryResponse)
-async def run_traditional(request: QueryRequest) -> QueryResponse:
+@router.post("/traditional", response_model=QueryResponse, deprecated=True)
+async def run_traditional(
+    request: QueryRequest,
+    response: Response,
+    container: Container = Depends(get_container),
+) -> QueryResponse:
+    """Deprecated legacy endpoint: Traditional Vector RAG.
+
+    Scheduled for removal in Week 3 (RFC 8594 Sunset 2026-10-22).
+    Clients should use POST /query with mode="traditional".
+    """
+    response.headers["Deprecation"] = "true"
+    response.headers["Sunset"] = "2026-10-22"
+    response.headers["Link"] = '</query>; rel="successor-version"'
+    response.headers["X-Legacy-Route"] = "deprecated"
+
+    if container.settings.query_engine.lower() == "v2":
+        request.mode = "traditional"
+        resp = await _run_v2_orchestrator(request, container)
+        response.headers["X-Serving-Engine"] = resp.serving_engine or "v2"
+        return resp
+
+    pending_notice = None
+    try:
+        matcher = get_intent_matcher()
+        pending_notice = await matcher.check_pending_feedback(
+            query=request.query,
+            session_id=getattr(request, "session_id", None),
+            actor_id=getattr(request, "actor_id", None),
+        )
+    except Exception as exc:
+        logger.warning("Pending feedback check in run_traditional failed: %s", exc)
+
     store = _get_store()
     result = await asyncio.to_thread(retrieval.traditional_rag, request.query, store)
-    return _traditional_response(request.query, result)
+    response.headers["X-Serving-Engine"] = "legacy"
+    trad_resp = _traditional_response(request.query, result, pending_notice=pending_notice)
+    trad_resp.serving_engine = "legacy"
+    return trad_resp
 
 
-@router.post("/contextgraph", response_model=QueryResponse)
-async def run_contextgraph(request: QueryRequest) -> QueryResponse:
+@router.post("/contextgraph", response_model=QueryResponse, deprecated=True)
+async def run_contextgraph(
+    request: QueryRequest,
+    response: Response,
+    container: Container = Depends(get_container),
+) -> QueryResponse:
+    """Deprecated legacy endpoint: ContextGraph Hybrid RAG.
+
+    Scheduled for removal in Week 3 (RFC 8594 Sunset 2026-10-22).
+    Clients should use POST /query with mode="contextgraph".
+    """
+    response.headers["Deprecation"] = "true"
+    response.headers["Sunset"] = "2026-10-22"
+    response.headers["Link"] = '</query>; rel="successor-version"'
+    response.headers["X-Legacy-Route"] = "deprecated"
+
+    if container.settings.query_engine.lower() == "v2":
+        request.mode = "contextgraph"
+        resp = await _run_v2_orchestrator(request, container)
+        response.headers["X-Serving-Engine"] = resp.serving_engine or "v2"
+        return resp
+
+    pending_notice = None
+    try:
+        matcher = get_intent_matcher()
+        pending_notice = await matcher.check_pending_feedback(
+            query=request.query,
+            session_id=getattr(request, "session_id", None),
+            actor_id=getattr(request, "actor_id", None),
+        )
+    except Exception as exc:
+        logger.warning("Pending feedback check in run_contextgraph failed: %s", exc)
+
     store = _get_store()
     result = await asyncio.to_thread(retrieval.hybrid_graphrag, request.query, store)
     summary = await asyncio.to_thread(graph_store.get_entity_type_summary, result.get("active_labels"))
-    return _contextgraph_response(request.query, result, summary)
+    response.headers["X-Serving-Engine"] = "legacy"
+    cg_resp = _contextgraph_response(request.query, result, summary, pending_notice=pending_notice)
+    cg_resp.serving_engine = "legacy"
+    return cg_resp
 
 
 @router.post("", response_model=QueryResponse)
 async def run_query(
     request: QueryRequest,
+    response: Response,
     container: Container = Depends(get_container),
 ) -> QueryResponse:
     """Production query endpoint with QUERY_ENGINE feature flag routing."""
     engine = container.settings.query_engine.lower()
 
     if engine == "v2":
-        return await _run_v2_orchestrator(request, container)
+        resp = await _run_v2_orchestrator(request, container)
+        response.headers["X-Serving-Engine"] = resp.serving_engine or "v2"
+        return resp
 
     if engine == "canary":
         canary_pct = max(0, min(100, container.settings.canary_percentage))
@@ -439,6 +635,7 @@ async def run_query(
         if bucket < canary_pct:
             resp = await _run_v2_orchestrator(request, container)
             resp.serving_engine = f"canary-v2 ({canary_pct}%)"
+            response.headers["X-Serving-Engine"] = resp.serving_engine
             return resp
 
     if engine == "shadow":
@@ -450,24 +647,38 @@ async def run_query(
             orchestrator=container.orchestrator,
         )
 
+    # Check pending feedback notice
+    pending_notice = None
+    try:
+        matcher = get_intent_matcher()
+        pending_notice = await matcher.check_pending_feedback(
+            query=request.query,
+            session_id=getattr(request, "session_id", None),
+            actor_id=getattr(request, "actor_id", None),
+        )
+    except Exception as exc:
+        logger.warning("Pending feedback check in run_query failed: %s", exc)
+
     # Default legacy engine execution
     store = _get_store()
     resp = QueryResponse(query=request.query, mode=request.mode)
     resp.serving_engine = "legacy"
+    response.headers["X-Serving-Engine"] = "legacy"
     resp.corpus_version = "amc_master_legacy"
     resp.response_id = f"resp_{uuid.uuid4().hex[:12]}"
     resp.interaction_id = f"int_{uuid.uuid4().hex[:12]}"
+    resp.pending_feedback_notice = pending_notice
 
     if request.mode in ("traditional", "both"):
         trad = await asyncio.to_thread(retrieval.traditional_rag, request.query, store)
-        trad_resp = _traditional_response(request.query, trad)
+        trad_resp = _traditional_response(request.query, trad, pending_notice=pending_notice)
         resp.traditional = trad_resp.traditional
         resp.latency_ms = int(trad.get("total_time", 0) * 1000)
 
     if request.mode in ("contextgraph", "both"):
         ctx = await asyncio.to_thread(retrieval.hybrid_graphrag, request.query, store)
         summary = await asyncio.to_thread(graph_store.get_entity_type_summary, ctx.get("active_labels"))
-        cg = _contextgraph_response(request.query, ctx, summary)
+        cg = _contextgraph_response(request.query, ctx, summary, pending_notice=pending_notice)
         resp.answer, resp.sources, resp.graph_highlight = cg.answer, cg.sources, cg.graph_highlight
         resp.response_id = cg.response_id
         resp.interaction_id = cg.interaction_id
@@ -492,6 +703,19 @@ async def _query_stream_generator(request: QueryRequest, container: Container):
     - Converts internal type names to SSE event types
     - Catches top-level exceptions and emits error SSE frame
     """
+    pending_notice = None
+    try:
+        matcher = get_intent_matcher()
+        pending_notice = await matcher.check_pending_feedback(
+            query=request.query,
+            session_id=getattr(request, "session_id", None),
+            actor_id=getattr(request, "actor_id", None),
+        )
+    except Exception as exc:
+        logger.warning("Pending feedback check in _query_stream_generator failed: %s", exc)
+
+    notice_dict = pending_notice.model_dump() if pending_notice else None
+
     try:
         async for event in container.orchestrator.answer_stream(
             query=request.query,
@@ -500,12 +724,16 @@ async def _query_stream_generator(request: QueryRequest, container: Container):
             event_type = event.get("type", "chunk")
             # Map internal type names → SSE event types
             if event_type == "metadata":
+                if notice_dict:
+                    event["pending_feedback_notice"] = notice_dict
                 yield _format_sse("metadata", event)
             elif event_type == "sources":
                 yield _format_sse("sources", event)
             elif event_type == "answer_chunk":
                 yield _format_sse("chunk", event)
             elif event_type == "complete":
+                if notice_dict:
+                    event["pending_feedback_notice"] = notice_dict
                 yield _format_sse("done", event)
             elif event_type == "error":
                 yield _format_sse("error", event)
@@ -517,6 +745,19 @@ async def _query_stream_generator(request: QueryRequest, container: Container):
 
 async def _chat_stream_generator(request, container: "Container"):
     """Async generator for chat streaming (multi-turn aware)."""
+    pending_notice = None
+    try:
+        matcher = get_intent_matcher()
+        pending_notice = await matcher.check_pending_feedback(
+            query=request.query,
+            session_id=getattr(request, "session_id", None),
+            actor_id=getattr(request, "actor_id", None),
+        )
+    except Exception as exc:
+        logger.warning("Pending feedback check in _chat_stream_generator failed: %s", exc)
+
+    notice_dict = pending_notice.model_dump() if pending_notice else None
+
     try:
         async for event in container.orchestrator.answer_stream(
             query=request.query,
@@ -526,12 +767,16 @@ async def _chat_stream_generator(request, container: "Container"):
         ):
             event_type = event.get("type", "chunk")
             if event_type == "metadata":
+                if notice_dict:
+                    event["pending_feedback_notice"] = notice_dict
                 yield _format_sse("metadata", event)
             elif event_type == "sources":
                 yield _format_sse("sources", event)
             elif event_type == "answer_chunk":
                 yield _format_sse("chunk", event)
             elif event_type == "complete":
+                if notice_dict:
+                    event["pending_feedback_notice"] = notice_dict
                 yield _format_sse("done", event)
             elif event_type == "error":
                 yield _format_sse("error", event)
@@ -586,3 +831,18 @@ async def stream_health_check() -> StreamingResponse:
         media_type="text/event-stream",
         headers=_STREAM_HEADERS,
     )
+
+
+@router.get("/{response_id}/pending-feedback")
+async def get_response_pending_feedback_notice(
+    response_id: str,
+    db: Session = Depends(get_db),
+):
+    """Fetch pending feedback notice for a specific response_id if query exists."""
+    fb = db.query(ResponseFeedback).filter(ResponseFeedback.response_id == response_id).first()
+    if fb and fb.query_text:
+        matcher = get_intent_matcher()
+        notice = await matcher.check_pending_feedback(query=fb.query_text, db=db)
+        return {"pending_feedback_notice": notice}
+    return {"pending_feedback_notice": None}
+

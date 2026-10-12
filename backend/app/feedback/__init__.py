@@ -24,6 +24,11 @@ from app.feedback.timeout_processor import (
     start_timeout_processor,
     stop_timeout_processor,
 )
+from app.feedback.intent_matcher import (
+    FeedbackIntentMatcher,
+    get_intent_matcher,
+    clear_pending_feedback_cache,
+)
 
 __all__ = [
     "DissatisfactionDetector",
@@ -46,4 +51,7 @@ __all__ = [
     "get_timeout_processor",
     "start_timeout_processor",
     "stop_timeout_processor",
+    "FeedbackIntentMatcher",
+    "get_intent_matcher",
+    "clear_pending_feedback_cache",
 ]

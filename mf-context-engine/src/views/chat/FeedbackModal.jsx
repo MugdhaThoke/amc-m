@@ -22,6 +22,7 @@ export default function FeedbackModal({ open, onClose, data }) {
           actorId={data.actorId}
           actorRole={data.actorRole}
           isCurrentTurn={data.isCurrentTurn}
+          pendingFeedbackNotice={data.pendingFeedbackNotice}
         />
       )}
     </ModalCard>

@@ -329,13 +329,24 @@ class IntentAwareCache:
             print(f"  [IntentCache] Invalidated cache bucket for domain '{domain_intent}'.", flush=True)
 
     def clear_all(self) -> None:
-        """Clear all cache buckets."""
+        """Clear all cache buckets AND pending feedback index."""
         for d in self._entries_by_domain:
             self._entries_by_domain[d].clear()
         self._fingerprint_index.clear()
+        self._clear_pending_feedback_cache()
         self._persist_to_disk()
 
-        print("  [IntentCache] Cleared all cache buckets.", flush=True)
+        print("  [IntentCache] Cleared all cache buckets + pending feedback index.", flush=True)
+
+    def _clear_pending_feedback_cache(self) -> None:
+        """Invalidate pending feedback notice cache."""
+        try:
+            from app.feedback.intent_matcher import clear_pending_feedback_cache
+            clear_pending_feedback_cache(suppress_prior_feedbacks=True)
+            logger.info("Cleared pending feedback notice cache")
+        except Exception as e:
+            logger.warning(f"Failed to clear pending feedback cache: {e}")
+
 
     def stats(self) -> dict:
         total = self._hits + self._misses

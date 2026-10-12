@@ -23,8 +23,16 @@ Context-engineered hybrid retrieval, now with node-matching corrected:
 """
 from __future__ import annotations
 import time
+import warnings
 import concurrent.futures
 from typing import Any, Dict, List
+
+warnings.warn(
+    "app.engine.retrieval is deprecated and scheduled for decommissioning in Week 3 of the V2 cutover plan. "
+    "All traffic should route to app.retrieval.orchestrator.RetrievalOrchestrator (PLAN-V2-TAKEOVER-001).",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from app.engine import config
 from app.engine import context_memory

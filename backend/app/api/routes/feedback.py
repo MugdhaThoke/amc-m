@@ -32,7 +32,8 @@ from app.models.compliance_models import Role
 from app.models.feedback import FeedbackIn, FeedbackOut
 from app.compliance.metrics_store import get_metrics_store
 from app.compliance.security import get_client_role, require_roles
-from app.core.database import SessionLocal
+from app.core.database import SessionLocal, get_db
+from app.feedback.intent_matcher import clear_pending_feedback_cache, get_intent_matcher
 from app.schemas.response_feedback_table import ResponseFeedback
 from sqlalchemy.orm import Session
 
@@ -46,6 +47,34 @@ router = APIRouter(prefix="/feedback", tags=["feedback"])
 def get_failure_taxonomy() -> Dict[str, Any]:
     """Retrieve the failure taxonomy categories with simple user-friendly labels and tooltips."""
     return {"categories": FAILURE_TAXONOMY}
+
+
+@router.get("/pending-notice")
+async def get_pending_feedback_notice(
+    query: str = Query(..., min_length=1, description="User query to check for pending repair feedback"),
+    session_id: Optional[str] = Query(None, description="Current session ID"),
+    actor_id: Optional[str] = Query(None, description="Current actor / user ID"),
+    db: Session = Depends(get_db),
+    current_role: Optional[Role] = Depends(get_client_role),
+) -> Dict[str, Any]:
+    """Check if query matches an existing feedback entry with pending repair."""
+    matcher = get_intent_matcher()
+    role_str = (
+        current_role.value
+        if hasattr(current_role, "value")
+        else str(current_role)
+        if current_role
+        else None
+    )
+    notice = await matcher.check_pending_feedback(
+        query=query,
+        session_id=session_id,
+        actor_id=actor_id,
+        db=db,
+        role=role_str,
+    )
+    return {"pending_feedback_notice": notice}
+
 
 @router.post("", response_model=FeedbackOut, status_code=status.HTTP_201_CREATED)
 @require_roles([Role.REVIEWER, Role.COMPLIANCE_OFFICER, Role.ADMIN])
@@ -150,6 +179,12 @@ def submit_feedback(
                 payload.response_id,
                 payload.session_id,
             )
+
+        # Invalidate in-memory query notice cache so subsequent checks reflect new submission
+        try:
+            clear_pending_feedback_cache(suppress_prior_feedbacks=False)
+        except Exception:
+            pass
         
         result = {
             "feedback_id": feedback_id,

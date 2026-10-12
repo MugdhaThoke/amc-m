@@ -228,36 +228,42 @@ export function adaptHybridResponse(hybridData, latencyMs = 0) {
     };
   });
 
-  const citations =
+  const rawCitations =
     (Array.isArray(synthesis.citations) && synthesis.citations.length > 0)
       ? synthesis.citations
       : (Array.isArray(hybridData.citations) && hybridData.citations.length > 0)
       ? hybridData.citations
       : (Array.isArray(sources) && sources.length > 0)
-      ? sources.map((s, i) => {
-          const docName = s.document_title || s.document_name || s.document_id || s.name || s.doc || `Source [${i + 1}]`;
-          const pageNum = s.page_number !== undefined ? s.page_number : (s.page !== undefined ? s.page : null);
-          const pageLabel = s.page_label || (pageNum != null ? `p. ${pageNum}` : "—");
-          let url = s.source_url || s.url || null;
-          if (!url && docName.toLowerCase().endsWith(".pdf")) {
-            url = `/api/files/${encodeURIComponent(docName)}${pageNum ? `#page=${pageNum}` : ""}`;
-          }
-          return {
-            marker: String(i + 1),
-            source: {
-              chunk_id: s.chunk_id || `src.${i + 1}`,
-              document_id: s.document_id || docName,
-              document_name: docName,
-              page_number: pageNum,
-              page_label: pageLabel,
-              verbatim_text: s.verbatim_text || s.full_text || s.snippet || "",
-              snippet: s.snippet || (s.verbatim_text ? s.verbatim_text.slice(0, 160) : ""),
-              source_url: url,
-              score: s.score || 0.9,
-            },
-          };
-        })
+      ? sources.map((s, i) => ({ marker: String(i + 1), source: s }))
       : [];
+
+  const citations = rawCitations.map((c, i) => {
+    const marker = c.marker || (c.source_index !== undefined ? String(c.source_index + 1) : String(i + 1));
+    const src = c.source || c;
+    const docName = src.document_name || src.document_title || src.name || src.doc || src.document_id || `Source [${i + 1}]`;
+    const pageNum = src.page_number !== undefined ? src.page_number : (src.page !== undefined ? src.page : null);
+    const pageLabel = src.page_label || (pageNum != null ? `p. ${pageNum}` : "—");
+    let url = src.source_url || src.url || null;
+    if (!url && docName.toLowerCase().endsWith(".pdf")) {
+      url = `/api/files/${encodeURIComponent(docName)}${pageNum ? `#page=${pageNum}` : ""}`;
+    }
+    return {
+      marker,
+      source: {
+        chunk_id: src.chunk_id || `src.${i + 1}`,
+        document_id: src.document_id || docName,
+        document_name: docName,
+        document_title: docName,
+        page_number: pageNum,
+        page_label: pageLabel,
+        verbatim_text: src.verbatim_text || src.full_text || src.snippet || "",
+        snippet: src.snippet || (src.verbatim_text ? src.verbatim_text.slice(0, 160) : ""),
+        source_url: url,
+        url: url,
+        score: src.score || 0.9,
+      },
+    };
+  });
 
   const metricsList =
     (Array.isArray(synthesis.metrics) && synthesis.metrics.length > 0)
@@ -322,6 +328,7 @@ export function adaptHybridResponse(hybridData, latencyMs = 0) {
     total_tokens: totalTokens,
     total_time: totalTime,
     telemetry_breakdown: tb,
+    pending_feedback_notice: hybridData.pending_feedback_notice || gh.pending_feedback_notice || null,
   };
 }
 
@@ -871,3 +878,20 @@ export async function detectFollowUpCorrection({
     }),
   });
 }
+
+// ── Pending Feedback Notice Endpoint ──────────────────────────────────────────
+
+export async function fetchPendingFeedbackNotice({ query, sessionId, actorId }) {
+  if (!query) return null;
+  const params = new URLSearchParams({ query });
+  if (sessionId) params.append("session_id", sessionId);
+  if (actorId) params.append("actor_id", actorId);
+  try {
+    const res = await request(`/feedback/pending-notice?${params.toString()}`);
+    return res?.pending_feedback_notice || null;
+  } catch (err) {
+    console.warn("Failed to fetch pending feedback notice:", err);
+    return null;
+  }
+}
+

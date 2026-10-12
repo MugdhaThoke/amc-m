@@ -726,11 +726,3 @@ benchmark-cache/
 !LICENSE*
 !Makefile
 !makefile
-
-# Large ML model files (ONNX, PyTorch models, tokenizers)
-backend/models/
-backend/models/*
-backend/models/gliner_config.json
-backend/models/gliner_medium_fp32.onnx
-backend/models/pytorch_model.bin
-mf-context-engine/models/

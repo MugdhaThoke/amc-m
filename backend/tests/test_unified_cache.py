@@ -63,3 +63,21 @@ class TestUnifiedSemanticCache:
         
         assert self.cache.lookup("q1", corpus_version="v1") is None
         assert self.cache.lookup("q2", corpus_version="v2") is not None
+
+    def test_dual_gate_exact_fingerprint_short_circuit(self):
+        payload = {"answer": "Short circuit test answer", "confidence": "high"}
+        self.cache.store("Exact match test query", payload)
+
+        class FailingEmbedder:
+            def __call__(self, text):
+                raise AssertionError("Embedder was called during exact fingerprint hit!")
+            def embed(self, texts):
+                raise AssertionError("Embedder was called during exact fingerprint hit!")
+
+        # Must succeed via Gate 1 without invoking FailingEmbedder
+        hit = self.cache.lookup("Exact match test query", embedder=FailingEmbedder())
+        assert hit is not None
+        assert hit["cache_hit"] is True
+        assert hit.get("cache_kind") == "exact"
+        assert hit.get("hit_type") == "Fingerprint"
+        assert hit["answer"] == payload["answer"]

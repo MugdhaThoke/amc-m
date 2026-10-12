@@ -148,6 +148,7 @@ export default function ContextGraphPanel({
               actorId={actorId}
               actorRole={actorRole}
               isCurrentTurn={isCurrentTurn}
+              pendingFeedbackNotice={r.pending_feedback_notice}
             />
           )}
         </div>

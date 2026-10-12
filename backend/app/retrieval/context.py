@@ -84,15 +84,23 @@ class ContextAssembler:
         doc_to_index: dict[str, int] = {}
 
         def source_index(document_id: str, title: str, chunk_id: str | None = None,
-                         snippet: str | None = None) -> int:
+                         snippet: str | None = None, page: int | None = None,
+                         verbatim: str | None = None) -> int:
             if document_id not in doc_to_index:
                 doc_to_index[document_id] = len(doc_to_index) + 1
+                page_val = page if page is not None else 1
+                url_val = f"/api/files/{document_id}#page={page_val}" if str(document_id).lower().endswith(".pdf") else None
                 sources.append(SourceAttribution(
                     source_index=doc_to_index[document_id],
                     document_id=document_id,
                     document_title=title,
                     chunk_id=chunk_id,
-                    snippet=snippet[:200] if snippet else None,
+                    snippet=snippet[:250] if snippet else None,
+                    page=page_val,
+                    page_number=page_val,
+                    page_label=f"p. {page_val}" if page_val is not None else "—",
+                    verbatim_text=verbatim or snippet or "",
+                    url=url_val,
                 ))
             return doc_to_index[document_id]
 
@@ -142,11 +150,14 @@ class ContextAssembler:
         vector_tokens_used = 0
         excerpt_parts: list[str] = []
         for chunk in sorted(result.chunks, key=lambda c: c.score, reverse=True):
+            chunk_page = getattr(chunk, "page_start", None) or getattr(chunk, "page", 1)
             idx = source_index(
                 chunk.document_id,
                 chunk.document_title or chunk.document_id,
                 chunk.chunk_id,
                 chunk.text,
+                page=chunk_page,
+                verbatim=chunk.text,
             )
             block = f"[{idx}] ({chunk.document_title}):\n{chunk.text}"
             cost = approx_tokens(block)
