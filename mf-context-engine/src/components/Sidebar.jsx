@@ -23,11 +23,13 @@ import {
   ChevronUp,
   ChevronDown,
   ClipboardCheck,
+  AlertCircle,
 } from "lucide-react";
 import { useAppState } from "../state/AppState";
 import { useToast } from "./widgets/Toast";
 import { ROLE_PERMISSIONS } from "../data/rbac";
 import { formatSidebarSessions } from "../utils/chatSessionUtils";
+import { FEATURES } from "../config/features";
 
 const WORKSPACE_TABS = [
   { label: "Chat", icon: MessageCircle, key: "chat" },
@@ -77,11 +79,17 @@ export default function Sidebar() {
 
   const role = activeUser?.role || "Compliance & Regulatory Officer";
   const perms = ROLE_PERMISSIONS[role] || {};
+  const canAdmin = perms.can_view_admin_panel ?? false;
+  const canCompare = perms.can_access_compare_tab ?? true;
+  const canAnalytics = perms.can_access_analytics_tab ?? true;
+
   const workspaceTabs = WORKSPACE_TABS.filter((t) => {
     if (!t.permKey) return true;
     const fallback = t.key === "admin" ? false : true;
     return perms[t.permKey] ?? fallback;
   });
+
+  const isFeedbackTriageActive = activePage === "feedback_triage" || activePage === "admin_feedback_issues";
 
   const [isAccountMenuOpen, setIsAccountMenuOpen] = useState(false);
   const [isWorkspaceOpen, setIsWorkspaceOpen] = useState(true);
@@ -134,6 +142,23 @@ export default function Sidebar() {
       toggleSidebar();
     }
   };
+
+  const handleMyFeedbackSelect = () => {
+    setActivePage("my_feedback");
+    if (typeof window !== "undefined" && window.innerWidth <= 1024) {
+      toggleSidebar();
+    }
+  };
+
+  const handleFeedbackTriageSelect = () => {
+    setActivePage("feedback_triage");
+    if (typeof window !== "undefined" && window.innerWidth <= 1024) {
+      toggleSidebar();
+    }
+  };
+
+  // Backwards-compatible alias for existing tests / references
+  const handleFeedbackIssuesSelect = handleFeedbackTriageSelect;
 
   const handlePageSelect = (pageId) => {
     setActivePage(pageId);
@@ -248,6 +273,32 @@ export default function Sidebar() {
                 </button>
               );
             })}
+
+            {/* Phase 3: "My Feedback" Personal View (Visible to all authenticated users) */}
+            {FEATURES.MY_FEEDBACK_PAGE_ENABLED && (
+              <button
+                type="button"
+                className={`cg-nav-item ${activePage === "my_feedback" ? "active" : ""}`}
+                onClick={handleMyFeedbackSelect}
+                title="My Reported Feedback"
+              >
+                <span className="cg-nav-icon"><MessageSquare size={18} strokeWidth={1.75} /></span>
+                <span className="cg-nav-label">My Feedback</span>
+              </button>
+            )}
+
+            {/* "Feedback & Triage" Top-Level Navigation Item (Admin Only) */}
+            {canAdmin && (
+              <button
+                type="button"
+                className={`cg-nav-item ${isFeedbackTriageActive ? "active" : ""}`}
+                onClick={handleFeedbackTriageSelect}
+                title="Feedback & Triage Queue"
+              >
+                <span className="cg-nav-icon"><AlertCircle size={18} strokeWidth={1.75} /></span>
+                <span className="cg-nav-label">Feedback &amp; Triage</span>
+              </button>
+            )}
           </nav>
         )}
       </div>

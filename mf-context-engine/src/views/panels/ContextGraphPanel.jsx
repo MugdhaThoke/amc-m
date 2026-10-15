@@ -147,6 +147,7 @@ export default function ContextGraphPanel({
               query={query || r.query || ""}
               actorId={actorId}
               actorRole={actorRole}
+              tenantId={r?.tenant_id || r?.tenantId}
               isCurrentTurn={isCurrentTurn}
               pendingFeedbackNotice={r.pending_feedback_notice}
             />

@@ -754,6 +754,127 @@ html.theme-transition *::after {
   text-overflow: ellipsis;
 }
 
+/* ── Expandable Admin & Governance Subgroup (Phase 2) ── */
+.cg-nav-group {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.cg-nav-group-header {
+  position: relative;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.42rem 0.65rem;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-ink-warm-600);
+  font-size: 0.86rem;
+  font-weight: 500;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-standard),
+              color var(--duration-fast) var(--ease-standard),
+              border-color var(--duration-fast) var(--ease-standard);
+}
+
+.cg-nav-group-header:hover {
+  background-color: rgba(var(--ink-rgb), 0.06);
+  color: var(--color-ink-warm-900);
+}
+
+.cg-nav-group-header.active-group {
+  color: var(--color-navy-700);
+  font-weight: 600;
+}
+
+.cg-nav-group-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  color: var(--color-ink-warm-400);
+  transition: transform var(--duration-fast) var(--ease-standard);
+}
+
+.cg-nav-sublist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-left: 0.85rem;
+  padding-left: 0.55rem;
+  border-left: 1.5px solid var(--color-border-subtle, rgba(0, 0, 0, 0.08));
+  margin-top: 2px;
+  margin-bottom: 4px;
+}
+
+.cg-nav-subitem {
+  position: relative;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.38rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--color-ink-warm-600);
+  font-size: 0.82rem;
+  font-weight: 500;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-standard),
+              color var(--duration-fast) var(--ease-standard),
+              border-color var(--duration-fast) var(--ease-standard);
+}
+
+.cg-nav-subitem:hover {
+  background-color: rgba(var(--ink-rgb), 0.05);
+  color: var(--color-ink-warm-900);
+}
+
+.cg-nav-subitem.active {
+  background-color: rgba(var(--navy-rgb), 0.11);
+  color: var(--color-navy-700);
+  font-weight: 600;
+  border-color: rgba(var(--navy-rgb), 0.16);
+}
+
+.cg-nav-subitem.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 2.5px;
+  height: 50%;
+  border-radius: 0 2px 2px 0;
+  background: var(--color-navy-700);
+  transform: translateY(-50%) scaleY(1);
+}
+
+.cg-nav-subicon {
+  font-size: 0.95rem;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  flex-shrink: 0;
+}
+
+.cg-nav-sublabel {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+
 /* ── 4. Chat History / Sessions Section ── */
 /* Navigation + chat history share one scroll context, so a short window
    squeezes nothing to zero — the whole middle scrolls instead. */
@@ -2641,6 +2762,216 @@ table.stDataFrame td.idx, table.stDataFrame th.idx { color: var(--color-ink-400)
   word-break: break-all;
 }
 
+/* ── Contextual Feedback Status Awareness Banner (Phase 2) ── */
+.cg-issue-awareness-banner {
+  background: #f0f7ff;
+  border: 1px solid #bfdbfe;
+  border-left: 4px solid #2563eb;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 10px 0 12px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: stFadeDown var(--duration-fast, 0.2s) var(--ease-out, ease-out);
+}
+
+.cg-issue-awareness-banner-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.cg-issue-awareness-banner-icon {
+  color: #2563eb;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.cg-issue-awareness-banner-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.cg-issue-awareness-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #1e3a8a;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.cg-issue-awareness-status-pill {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.cg-issue-status--reported {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fde68a;
+}
+
+.cg-issue-status--under_review {
+  background: #e0e7ff;
+  color: #3730a3;
+  border: 1px solid #c7d2fe;
+}
+
+.cg-issue-status--in_repair {
+  background: #fef9c3;
+  color: #854d0e;
+  border: 1px solid #fef08a;
+}
+
+.cg-issue-status--reopened {
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+}
+
+.cg-issue-status--resolved {
+  background: #dcfce7;
+  color: #166534;
+  border: 1px solid #bbf7d0;
+}
+
+.cg-issue-status--closed {
+  background: #f1f5f9;
+  color: #475569;
+  border: 1px solid #cbd5e1;
+}
+
+.cg-issue-awareness-match-pill {
+  font-size: 9.5px;
+  font-weight: 600;
+  background: #e2e8f0;
+  color: #475569;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid #cbd5e1;
+  text-transform: uppercase;
+}
+
+.cg-issue-awareness-message {
+  font-size: 12px;
+  color: #1e293b;
+  line-height: 1.45;
+  margin-top: 3px;
+}
+
+.cg-issue-awareness-contributors {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: #475569;
+  margin-top: 4px;
+  font-weight: 500;
+}
+
+.cg-issue-awareness-note {
+  font-size: 11px;
+  color: #64748b;
+  margin-top: 4px;
+  font-style: italic;
+}
+
+/* Phase 4: Category Breakdown in Status Banner */
+.cg-issue-category-breakdown {
+  margin-top: 8px;
+  margin-bottom: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.cg-issue-category-header {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: #334155;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.cg-issue-category-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.cg-category-breakdown-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: #ffffff;
+  border: 1px solid #bfdbfe;
+  color: #1e40af;
+  padding: 2.5px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.3;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  transition: all 0.15s ease;
+}
+
+.cg-category-breakdown-pill:hover {
+  background: #eff6ff;
+  border-color: #93c5fd;
+}
+
+.cg-category-breakdown-code {
+  font-weight: 700;
+  color: #1d4ed8;
+}
+
+.cg-category-breakdown-label {
+  color: #1e293b;
+  max-width: 170px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cg-category-breakdown-multiplier {
+  background: #dbeafe;
+  color: #1e40af;
+  padding: 1px 5px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.cg-category-breakdown-expander {
+  background: #f1f5f9;
+  border: 1px dashed #cbd5e1;
+  color: #475569;
+  padding: 2.5px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.cg-category-breakdown-expander:hover {
+  background: #e2e8f0;
+  color: #1e293b;
+}
+
+.cg-feedback-issue-link {
+  color: #1e3a8a;
+  font-weight: 500;
+}
+
 /* ── Clickable Citation Links in Sources block ── */
 .cg-citation-item {
   display: flex;
@@ -3973,6 +4304,23 @@ table.stDataFrame td.idx, table.stDataFrame th.idx { color: var(--color-ink-400)
 
   /* In the icon rail the tint alone marks the active item */
   .stSidebar--collapsed .cg-nav-item::before { display: none; }
+  .stSidebar--collapsed .cg-nav-group-header { display: none !important; }
+  .stSidebar--collapsed .cg-nav-sublist {
+    margin-left: 0 !important;
+    padding-left: 0 !important;
+    border-left: none !important;
+    align-items: center !important;
+    width: 100% !important;
+  }
+  .stSidebar--collapsed .cg-nav-subitem {
+    width: 40px !important;
+    height: 40px !important;
+    padding: 0 !important;
+    justify-content: center !important;
+    border-radius: 8px !important;
+  }
+  .stSidebar--collapsed .cg-nav-sublabel { display: none !important; }
+  .stSidebar--collapsed .cg-nav-subitem::before { display: none !important; }
 }
 
 /* ── 1. Tablet Landscape & Smaller Laptops (<= 1024px) ─────────────────── */

@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Plus, Trash2 } from "lucide-react";
+import { Plus, Trash2, Database, RefreshCw } from "lucide-react";
 import DataFrame from "../../components/widgets/DataFrame";
 import Divider from "../../components/widgets/Divider";
 import TextInput from "../../components/widgets/TextInput";
@@ -10,7 +10,16 @@ import { AMCRole } from "../../data/rbac";
 import { useAppState } from "../../state/AppState";
 
 export default function AdminUsersTab() {
-  const { users, saveUserProfile, deleteUserProfile, activeUser, activeUsername, authedUsername } = useAppState();
+  const {
+    users,
+    saveUserProfile,
+    deleteUserProfile,
+    activeUser,
+    activeUsername,
+    authedUsername,
+    refreshUsers,
+    isUsersSyncing,
+  } = useAppState();
 
   const currentAdmin = (authedUsername || activeUsername || activeUser?.username || "").trim();
   const normalize = (s) => (s || "").trim().toLowerCase().replace(".", "_");
@@ -18,6 +27,13 @@ export default function AdminUsersTab() {
     if (!currentAdmin || !uname) return false;
     return normalize(uname) === normalize(currentAdmin);
   };
+
+  // Re-sync with backend (data.db auth_users) on tab mount
+  useEffect(() => {
+    if (typeof refreshUsers === "function") {
+      refreshUsers();
+    }
+  }, [refreshUsers]);
 
   const [username, setUsername] = useState("");
   const [fullName, setFullName] = useState("");
@@ -27,10 +43,15 @@ export default function AdminUsersTab() {
   const [password, setPassword] = useState("");
   const [formMsg, setFormMsg] = useState(null);
 
+  // System-protected users that cannot be removed
+  const protectedUsernames = ["sarah_compliance", "sarah.compliance", "compliance_officer", "admin", "amc_admin", "amc_auditor", "amc_researcher"];
+  const isProtectedUser = (uname) => {
+    const norm = normalize(uname);
+    return isSelf(uname) || protectedUsernames.some((p) => normalize(p) === norm);
+  };
+
   // Filter out system-protected default users AND the currently logged in administrator's account
-  const removableUsers = users.filter(
-    (u) => !isSelf(u.username) && u.username !== "sarah_compliance"
-  );
+  const removableUsers = users.filter((u) => !isProtectedUser(u.username));
 
   const [delUser, setDelUser] = useState(removableUsers[0]?.username || "");
   const [delMsg, setDelMsg] = useState(null);
@@ -60,7 +81,7 @@ export default function AdminUsersTab() {
         const assignedPwd = resp?.assigned_password || password.trim() || "Welcome@2026";
         setFormMsg({
           type: "success",
-          text: `User profile '${username.trim().toLowerCase()}' successfully saved! Login password: '${assignedPwd}'. The user can now log in using these credentials.`,
+          text: `User profile '${username.trim().toLowerCase()}' successfully saved and synchronized with data.db auth users! Login password: '${assignedPwd}'. The user can now log in using these credentials.`,
         });
         setUsername("");
         setFullName("");
@@ -83,7 +104,7 @@ export default function AdminUsersTab() {
     }
     try {
       await deleteUserProfile(delUser);
-      setDelMsg({ type: "success", text: `User profile '${delUser}' removed.` });
+      setDelMsg({ type: "success", text: `User profile '${delUser}' removed and synchronized with data.db auth users.` });
     } catch (err) {
       setDelMsg({ type: "error", text: err?.message || `Failed to remove user '${delUser}'.` });
     }
@@ -91,7 +112,40 @@ export default function AdminUsersTab() {
 
   return (
     <div>
-      <h3 className="stSubheader">Active User Profiles</h3>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+        <div>
+          <h3 className="stSubheader" style={{ margin: 0, display: "flex", alignItems: "center", gap: 8 }}>
+            <Database size={18} style={{ color: "var(--color-navy-700, #1e3a8a)" }} />
+            Active User Profiles
+          </h3>
+          <div style={{ fontSize: "0.82rem", color: "var(--text-muted, #64748b)", marginTop: 4 }}>
+            Synchronized with <code style={{ fontSize: "0.78rem" }}>data.db</code> auth users ({users.length} active profiles)
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => refreshUsers && refreshUsers()}
+          disabled={isUsersSyncing}
+          className="stButton"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "5px 12px",
+            fontSize: "0.82rem",
+            fontWeight: 500,
+            cursor: isUsersSyncing ? "wait" : "pointer",
+            borderRadius: 6,
+            border: "1px solid var(--border-color, #cbd5e1)",
+            backgroundColor: "transparent",
+            color: "var(--text-color, #1e293b)",
+          }}
+          title="Re-sync active user profiles from data.db auth_users"
+        >
+          <RefreshCw size={13} style={{ animation: isUsersSyncing ? "st-spin 0.7s linear infinite" : "none" }} />
+          {isUsersSyncing ? "Syncing..." : "Sync with Database"}
+        </button>
+      </div>
       <DataFrame
         columns={["username", "full_name", "role", "department", "email", "status"]}
         rows={users}

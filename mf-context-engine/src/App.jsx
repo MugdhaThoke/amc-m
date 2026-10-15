@@ -1,7 +1,7 @@
 import { MessageCircle, Scale, BarChart3, UserCog, Menu, X } from "lucide-react";
 import Sidebar from "./components/Sidebar";
 import Tabs from "./components/widgets/Tabs";
-import { Users, KeyRound, FileClock, UploadCloud } from "lucide-react";
+import { Users, KeyRound, FileClock, UploadCloud, AlertCircle } from "lucide-react";
 import ChatTab from "./views/ChatTab";
 import CompareTab from "./views/CompareTab";
 import AnalyticsTab from "./views/AnalyticsTab";
@@ -9,6 +9,8 @@ import AdminUsersTab from "./views/admin/AdminUsersTab";
 import AdminRbacTab from "./views/admin/AdminRbacTab";
 import AdminAuditTab from "./views/admin/AdminAuditTab";
 import AdminIngestTab from "./views/admin/AdminIngestTab";
+import AdminFeedbackIssuesTab from "./views/admin/AdminFeedbackIssuesTab";
+import MyFeedbackPage from "./views/pages/MyFeedbackPage";
 import ScorecardPage from "./views/pages/ScorecardPage";
 import ViolationsPage from "./views/pages/ViolationsPage";
 import FundsPage from "./views/pages/FundsPage";
@@ -18,6 +20,7 @@ import GovernancePage from "./views/pages/GovernancePage";
 import LoginScreen from "./components/auth/LoginScreen";
 import { useAppState } from "./state/AppState";
 import { ROLE_PERMISSIONS } from "./data/rbac";
+import { FEATURES } from "./config/features";
 
 function AdminView() {
   const { adminSubTab, setAdminSubTab } = useAppState();
@@ -27,18 +30,21 @@ function AdminView() {
     { label: "Security & Audit Logs", icon: FileClock },
     { label: "Authorized Ingest & Pipeline", icon: UploadCloud },
   ];
+
+  const clampedSubTab = adminSubTab >= tabNames.length ? 0 : adminSubTab;
+
   return (
     <div>
-      <h2 className="stHeader2">Admin Panel &amp; Enterprise RBAC Governance</h2>
+      <h2 className="stHeader2">Admin &amp; Governance</h2>
       <div className="stCaption">
-        Manage user profiles, assign AMC organizational roles, inspect clearance boundaries, and view audit trails.
+        Manage user profiles, assign AMC organizational roles, review security audit trails, and oversee document ingestion pipelines.
       </div>
-      <Tabs tabs={tabNames} active={adminSubTab} onChange={setAdminSubTab} />
+      <Tabs tabs={tabNames} active={clampedSubTab} onChange={setAdminSubTab} />
       <div className="stTabs-panel">
-        {adminSubTab === 0 && <AdminUsersTab />}
-        {adminSubTab === 1 && <AdminRbacTab />}
-        {adminSubTab === 2 && <AdminAuditTab />}
-        {adminSubTab === 3 && <AdminIngestTab />}
+        {clampedSubTab === 0 && <AdminUsersTab />}
+        {clampedSubTab === 1 && <AdminRbacTab />}
+        {clampedSubTab === 2 && <AdminAuditTab />}
+        {clampedSubTab === 3 && <AdminIngestTab />}
       </div>
     </div>
   );
@@ -103,7 +109,11 @@ export default function App() {
             </span>
             <span className="stMobileHeader-badge">
               {activePage && activePage !== "app"
-                ? activePage.replace(/^\d+_/, "")
+                ? (activePage === "feedback_triage" || activePage === "admin_feedback_issues"
+                    ? "Feedback & Triage"
+                    : activePage === "my_feedback"
+                    ? "My Feedback"
+                    : activePage.replace(/^\d+_/, ""))
                 : tabNames[clampedTab]?.label}
             </span>
           </div>
@@ -121,6 +131,22 @@ export default function App() {
           {activePage === "04_Remediation" && <RemediationPage />}
           {activePage === "05_Multi_Region" && <MultiRegionPage />}
           {activePage === "06_Governance" && <GovernancePage />}
+          {activePage === "my_feedback" && <MyFeedbackPage />}
+          {(activePage === "feedback_triage" || activePage === "admin_feedback_issues") && (
+            canAdmin ? (
+              <AdminFeedbackIssuesTab />
+            ) : (
+              <div style={{ padding: "2.5rem 1rem", maxWidth: "600px", margin: "0 auto" }}>
+                <div className="stAlert stAlert--error" style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+                  <AlertCircle size={22} />
+                  <div>
+                    <strong style={{ display: "block", marginBottom: "0.25rem" }}>Access Denied (403)</strong>
+                    <span>Administrator privileges are required to access Feedback &amp; Triage.</span>
+                  </div>
+                </div>
+              </div>
+            )
+          )}
           {(!activePage || activePage === "app") && (
             <div className="stTabs-panel">
               {clampedTab === chatIdx && <ChatTab />}

@@ -1290,6 +1290,24 @@ export function AppStateProvider({ children }) {
     setProposedEdges((prev) => prev.filter((p) => p.edge_id !== id));
   }, []);
 
+  const [isUsersSyncing, setIsUsersSyncing] = useState(false);
+
+  const refreshUsers = useCallback(async (options = {}) => {
+    setIsUsersSyncing(true);
+    try {
+      const u = await fetchUsers(options);
+      if (u && u.users && Array.isArray(u.users)) {
+        setUsers(u.users);
+        return u.users;
+      }
+    } catch (err) {
+      console.warn("Failed to refresh users from backend:", err);
+    } finally {
+      setIsUsersSyncing(false);
+    }
+    return null;
+  }, [setUsers]);
+
   const saveUserProfile = useCallback(
     async (profile) => {
       let result = null;
@@ -1298,6 +1316,13 @@ export function AppStateProvider({ children }) {
       } catch (err) {
         console.warn("Backend user save failed, applying locally:", err);
       }
+      try {
+        const u = await fetchUsers();
+        if (u && u.users && Array.isArray(u.users)) {
+          setUsers(u.users);
+          return result;
+        }
+      } catch {}
       setUsers((prev) => {
         const filtered = prev.filter((u) => u.username !== profile.username);
         return [...filtered, profile];
@@ -1320,6 +1345,13 @@ export function AppStateProvider({ children }) {
         console.warn("Backend user delete failed:", err);
         throw err;
       }
+      try {
+        const u = await fetchUsers();
+        if (u && u.users && Array.isArray(u.users)) {
+          setUsers(u.users);
+          return;
+        }
+      } catch {}
       setUsers((prev) => prev.filter((u) => u.username !== username));
     },
     [setUsers, authedUsername, activeUsername, activeUser]
@@ -1348,7 +1380,10 @@ export function AppStateProvider({ children }) {
         const u = await fetchUsers();
         if (u && u.users && u.users.length > 0) {
           setUsers(u.users);
-          setActiveUsername((prev) => (u.users.some((x) => x.username === prev) ? prev : u.users[0].username));
+          setActiveUsername((prev) => {
+            const current = authedUsername || prev;
+            return u.users.some((x) => x.username === current) ? current : (u.users[0]?.username || prev);
+          });
         }
       } catch {
         // use local storage / fallback
@@ -1388,6 +1423,7 @@ export function AppStateProvider({ children }) {
 
     // Users & RBAC
     users, setUsers,
+    refreshUsers, isUsersSyncing,
     activeUsername, setActiveUsername,
     activeUser, activePermissions,
     saveUserProfile, deleteUserProfile,
@@ -1454,6 +1490,8 @@ export function useAppState() {
 export function useUser() {
   const {
     users,
+    refreshUsers,
+    isUsersSyncing,
     activeUser,
     activeUsername,
     setActiveUsername,
@@ -1467,6 +1505,8 @@ export function useUser() {
   } = useAppState();
   return {
     users,
+    refreshUsers,
+    isUsersSyncing,
     activeUser,
     activeUsername,
     setActiveUsername,

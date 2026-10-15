@@ -488,8 +488,19 @@ export async function invalidateIntentCacheDomain(domain) {
   });
 }
 
-export async function fetchUsers() {
-  return await request("/admin/users", { method: "GET" });
+export async function fetchUsers(options = {}) {
+  const query = new URLSearchParams();
+  if (options.activeOnly) query.set("active_only", "true");
+  if (options.sync) query.set("sync", "true");
+  const qs = query.toString();
+  return await request(`/admin/users${qs ? `?${qs}` : ""}`, { method: "GET" });
+}
+
+export async function syncUsersWithDb(options = {}) {
+  const query = new URLSearchParams();
+  if (options.activeOnly) query.set("active_only", "true");
+  const qs = query.toString();
+  return await request(`/admin/users/sync${qs ? `?${qs}` : ""}`, { method: "POST" });
 }
 
 export async function saveUser(user) {
@@ -957,4 +968,80 @@ export async function fetchPendingFeedbackNotice({ query, sessionId, actorId }) 
     return null;
   }
 }
+
+// ── Feedback Issue Status Endpoint (Phase 1 & 2 Contextual Status Awareness) ──
+export async function fetchFeedbackStatus({ responseId, query, sessionId, tenantId } = {}) {
+  const params = new URLSearchParams();
+  if (responseId) params.append("response_id", responseId);
+  if (query) params.append("query", query);
+  if (sessionId) params.append("session_id", sessionId);
+  if (tenantId) params.append("tenant_id", tenantId);
+
+  try {
+    const res = await request(`/feedback/status?${params.toString()}`);
+    return res;
+  } catch (err) {
+    console.warn("Failed to fetch feedback status:", err);
+    return { has_existing_issue: false };
+  }
+}
+
+// ── Feedback Issues & Triage Endpoints (Phase 4 Admin Visibility & Phase 3 My Feedback) ──
+
+export async function fetchMyFeedback({ limit = 50, offset = 0, page, pageSize, q, status } = {}) {
+  const params = new URLSearchParams();
+  if (limit) params.append("limit", limit);
+  if (offset) params.append("offset", offset);
+  if (page) params.append("page", page);
+  if (pageSize) params.append("page_size", pageSize);
+  if (q && q.trim()) params.append("q", q.trim());
+  if (status && status !== "All") params.append("status", status.toLowerCase());
+
+  return await request(`/feedback/mine?${params.toString()}`, { method: "GET" });
+}
+
+export async function fetchFeedbackIssues({ status, tenantId, limit = 50, offset = 0, page, pageSize, q } = {}) {
+  const params = new URLSearchParams();
+  if (status && status !== "All") params.append("status", status.toLowerCase());
+  if (tenantId) params.append("tenant_id", tenantId);
+  if (limit) params.append("limit", limit);
+  if (offset) params.append("offset", offset);
+  if (page) params.append("page", page);
+  if (pageSize) params.append("page_size", pageSize);
+  if (q && q.trim()) params.append("q", q.trim());
+
+  return await request(`/feedback/issues?${params.toString()}`, { method: "GET" });
+}
+
+export async function fetchFeedbackTelemetry() {
+  return await request("/feedback/telemetry", { method: "GET" });
+}
+
+
+export async function fetchFeedbackIssueDetail(issueId) {
+  return await request(`/feedback/issues/${encodeURIComponent(issueId)}`, { method: "GET" });
+}
+
+export async function updateIssueStatus(issueId, { status, resolutionNotes, actorId }) {
+  return await request(`/feedback/issues/${encodeURIComponent(issueId)}/status`, {
+    method: "POST",
+    body: JSON.stringify({
+      status,
+      resolution_notes: resolutionNotes || undefined,
+      actor_id: actorId || undefined,
+    }),
+  });
+}
+
+export async function initiateIssueRepair(issueId, { actorId, metadata } = {}) {
+  return await request(`/feedback/issues/${encodeURIComponent(issueId)}/repair`, {
+    method: "POST",
+    body: JSON.stringify({
+      actor_id: actorId || undefined,
+      metadata: metadata || undefined,
+    }),
+  });
+}
+
+
 

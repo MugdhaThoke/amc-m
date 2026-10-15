@@ -21,6 +21,7 @@ export default function FeedbackModal({ open, onClose, data }) {
           query={data.query}
           actorId={data.actorId}
           actorRole={data.actorRole}
+          tenantId={data.tenantId}
           isCurrentTurn={data.isCurrentTurn}
           pendingFeedbackNotice={data.pendingFeedbackNotice}
         />

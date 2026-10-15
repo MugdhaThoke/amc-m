@@ -1,15 +1,21 @@
 import { useState, useEffect, useCallback } from "react";
-import { CheckCircle2, AlertTriangle, AlertCircle } from "lucide-react";
+import { CheckCircle2, AlertTriangle, AlertCircle, Users } from "lucide-react";
 import FailureCheckboxGrid from "./FailureCheckboxGrid";
 import FeedbackInputRow from "./FeedbackInputRow";
-import { submitFeedback, fetchPendingFeedbackNotice } from "../../services/api";
+import { submitFeedback, fetchPendingFeedbackNotice, fetchFeedbackStatus } from "../../services/api";
 import { useAppState } from "../../state/AppState";
+import { FEATURES } from "../../config/features";
+import { FAILURE_TAXONOMY } from "../../constants/failureTaxonomy";
+
+const TAXONOMY_BY_CODE = Object.fromEntries(
+  FAILURE_TAXONOMY.map((item) => [item.code.toUpperCase(), item])
+);
 
 /**
  * FeedbackContainer
  * ─────────────────────────────────────────────────────────────────────────────
  * Per-response feedback container positioned as the last child inside the
- * ContextGraph result card. Scoped strictly to response_id.
+ * ContextGraph result card or within the FeedbackModal. Scoped strictly to response_id.
  */
 export default function FeedbackContainer({
   responseId,
@@ -19,10 +25,13 @@ export default function FeedbackContainer({
   query = "",
   actorId,
   actorRole,
+  tenantId,
   isCurrentTurn = true,
   pendingFeedbackNotice = null,
 }) {
   const { activeUser } = useAppState();
+
+  const isFeedbackStatusEnabled = import.meta.env?.VITE_ENABLE_FEEDBACK_STATUS_AWARENESS !== "false";
 
   const effectiveActorId = actorId || activeUser?.username || "compliance_reviewer";
   const effectiveActorRole = actorRole || activeUser?.role || "Compliance & Regulatory Officer";
@@ -31,9 +40,47 @@ export default function FeedbackContainer({
   const [freeText, setFreeText] = useState("");
   const [submitState, setSubmitState] = useState("idle"); // 'idle' | 'submitting' | 'success' | 'error'
   const [feedbackId, setFeedbackId] = useState(null);
+  const [submittedIssueInfo, setSubmittedIssueInfo] = useState(null);
   const [errorMessage, setErrorMessage] = useState(null);
   const [lastSubmittedAt, setLastSubmittedAt] = useState(null);
   const [notice, setNotice] = useState(pendingFeedbackNotice);
+  const [issueStatus, setIssueStatus] = useState(null);
+  const [isCategoryBreakdownExpanded, setIsCategoryBreakdownExpanded] = useState(false);
+
+  // Status check when modal / container mounts or query changes (non-blocking)
+  useEffect(() => {
+    if (!isFeedbackStatusEnabled) {
+      setIssueStatus(null);
+      return;
+    }
+    if (!query && !responseId) {
+      setIssueStatus(null);
+      return;
+    }
+
+    let active = true;
+    fetchFeedbackStatus({
+      responseId: responseId || undefined,
+      query: query || undefined,
+      sessionId: sessionId || undefined,
+      tenantId: tenantId || undefined,
+    })
+      .then((res) => {
+        if (active && res?.has_existing_issue) {
+          setIssueStatus(res);
+        } else if (active) {
+          setIssueStatus(null);
+        }
+      })
+      .catch((err) => {
+        console.warn("Issue status check failed:", err);
+        if (active) setIssueStatus(null);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [isFeedbackStatusEnabled, responseId, query, sessionId, tenantId]);
 
   useEffect(() => {
     if (pendingFeedbackNotice !== undefined && pendingFeedbackNotice !== null) {
@@ -67,6 +114,7 @@ export default function FeedbackContainer({
     setFreeText("");
     setSubmitState("idle");
     setFeedbackId(null);
+    setSubmittedIssueInfo(null);
     setErrorMessage(null);
     setLastSubmittedAt(null);
   }, [responseId]);
@@ -111,6 +159,14 @@ export default function FeedbackContainer({
     try {
       const res = await submitFeedback(payload);
       setFeedbackId(res.feedback_id);
+      if (res.issue_id) {
+        setSubmittedIssueInfo({
+          issueId: res.issue_id,
+          issueStatus: res.issue_status,
+          wasMatched: res.was_matched_to_existing_issue,
+          matchType: res.match_type,
+        });
+      }
       setLastSubmittedAt(res.stored_at || new Date().toISOString());
       setSubmitState("success");
     } catch (err) {
@@ -138,7 +194,103 @@ export default function FeedbackContainer({
         </div>
       </div>
 
-      {notice?.has_pending_feedback && (
+      {/* Contextual Feedback Status Awareness Banner (Phase 2) */}
+      {isFeedbackStatusEnabled && issueStatus?.has_existing_issue && (
+        <div className="cg-issue-awareness-banner" role="status">
+          <div className="cg-issue-awareness-banner-header">
+            <div className="cg-issue-awareness-banner-icon">
+              <AlertCircle size={16} />
+            </div>
+            <div className="cg-issue-awareness-banner-content">
+              <div className="cg-issue-awareness-title">
+                <span>Issue Status Awareness</span>
+                {issueStatus.status && (
+                  <span className={`cg-issue-awareness-status-pill cg-issue-status--${issueStatus.status}`}>
+                    {issueStatus.status.replace("_", " ")}
+                  </span>
+                )}
+                {issueStatus.match_type && (
+                  <span className="cg-issue-awareness-match-pill">
+                    {issueStatus.match_type} match
+                  </span>
+                )}
+              </div>
+              <div className="cg-issue-awareness-message">
+                {issueStatus.message || "A similar query has already been reported. The issue is pending review or repair."}
+              </div>
+              {Boolean(issueStatus.contributor_count && issueStatus.contributor_count > 0) && (
+                <div className="cg-issue-awareness-contributors">
+                  <Users size={12} />
+                  <span>
+                    {issueStatus.contributor_count} {issueStatus.contributor_count === 1 ? "user has" : "users have"} reported this issue so far
+                  </span>
+                </div>
+              )}
+
+              {/* Phase 4: Category Breakdown Pills */}
+              {FEATURES.FEEDBACK_CATEGORY_BREAKDOWN_BANNER_ENABLED &&
+                issueStatus.category_breakdown &&
+                issueStatus.category_breakdown.length > 0 && (
+                  <div className="cg-issue-category-breakdown">
+                    <div className="cg-issue-category-header">Previously flagged:</div>
+                    <div className="cg-issue-category-pills">
+                      {(isCategoryBreakdownExpanded
+                        ? issueStatus.category_breakdown
+                        : issueStatus.category_breakdown.slice(0, 5)
+                      ).map((cat) => {
+                        const codeUpper = (cat.code || "").toUpperCase();
+                        const taxInfo = TAXONOMY_BY_CODE[codeUpper];
+                        const label = cat.label || taxInfo?.label || codeUpper;
+                        const tooltip = taxInfo?.tooltip || `${label} (${codeUpper})`;
+                        const count = cat.count || 1;
+
+                        return (
+                          <span
+                            key={codeUpper}
+                            className="cg-category-breakdown-pill"
+                            title={tooltip}
+                          >
+                            <span className="cg-category-breakdown-code">{codeUpper}</span>
+                            <span className="cg-category-breakdown-label">{label}</span>
+                            {count > 1 && (
+                              <span className="cg-category-breakdown-multiplier">
+                                &times;{count}
+                              </span>
+                            )}
+                          </span>
+                        );
+                      })}
+
+                      {issueStatus.category_breakdown.length > 5 && (
+                        <button
+                          type="button"
+                          className="cg-category-breakdown-expander"
+                          onClick={() => setIsCategoryBreakdownExpanded((prev) => !prev)}
+                          title={
+                            isCategoryBreakdownExpanded
+                              ? "Show top 5 categories"
+                              : "Show all flagged categories"
+                          }
+                        >
+                          {isCategoryBreakdownExpanded
+                            ? "Show less"
+                            : `+${issueStatus.category_breakdown.length - 5} more`}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+              )}
+
+              <div className="cg-issue-awareness-note">
+                You can still submit additional feedback below.
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Fallback pending notice when issue status banner is not shown */}
+      {(!isFeedbackStatusEnabled || !issueStatus?.has_existing_issue) && notice?.has_pending_feedback && (
         <div className="cg-pending-feedback-banner" role="status">
           <div className="cg-pending-feedback-banner-header">
             <div className="cg-pending-feedback-banner-icon">
@@ -228,11 +380,21 @@ export default function FeedbackContainer({
       {submitState === "success" && (
         <div className="cg-feedback-status cg-feedback-status--success">
           <span className="cg-feedback-status-icon"><CheckCircle2 size={14} strokeWidth={2} /></span>
-          <span>
-            <b>Feedback recorded</b> — ID: <code>{feedbackId}</code>
-            {lastSubmittedAt && ` at ${new Date(lastSubmittedAt).toLocaleTimeString()}`}
-            {effectiveActorId && ` (Reviewer: ${effectiveActorId})`}
-          </span>
+          <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+            <span>
+              <b>Feedback recorded</b> — ID: <code>{feedbackId}</code>
+              {lastSubmittedAt && ` at ${new Date(lastSubmittedAt).toLocaleTimeString()}`}
+              {effectiveActorId && ` (Reviewer: ${effectiveActorId})`}
+            </span>
+            {submittedIssueInfo?.issueId && (
+              <span style={{ fontSize: "11px", opacity: 0.9 }}>
+                Attached to Issue: <code>{submittedIssueInfo.issueId}</code>
+                {` (${(submittedIssueInfo.issueStatus || "reported").replace("_", " ")}`}
+                {submittedIssueInfo.wasMatched ? " · linked to existing" : " · new issue"}
+                {submittedIssueInfo.matchType ? ` · ${submittedIssueInfo.matchType}` : ""})
+              </span>
+            )}
+          </div>
         </div>
       )}
 
