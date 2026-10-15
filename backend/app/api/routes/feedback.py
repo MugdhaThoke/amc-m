@@ -26,14 +26,33 @@ from datetime import datetime, timezone
 
 from app.compliance.failure_taxonomy import FAILURE_TAXONOMY, VALID_CODES
 from app.models.feedback_quality import FeedbackQualityMetrics
+from app.models.feedback_quality import FeedbackQualityMetrics
 from app.models.feedback_analytics import FeedbackCategoryAnalytics
 from app.models.response_quality import ResponseQualityMetrics
 from app.models.compliance_models import Role
-from app.models.feedback import FeedbackIn, FeedbackOut
+from app.api.deps import CurrentUser, OptionalCurrentUser
+from app.config import get_settings
+from app.models.feedback import (
+    CategoryBreakdownItem,
+    FeedbackIn,
+    FeedbackOut,
+    FeedbackStatusCheckResponse,
+    FeedbackIssueDetailOut,
+    FeedbackIssueListOut,
+    IssueRepairTransitionRequest,
+    IssueRepairTransitionResponse,
+    IssueStatusUpdateRequest,
+    MyFeedbackItemOut,
+    MyFeedbackListOut,
+)
 from app.compliance.metrics_store import get_metrics_store
 from app.compliance.security import get_client_role, require_roles
 from app.core.database import SessionLocal, get_db
+from app.feedback import issue_store
+from app.feedback.feedback_cache import get_feedback_cache
 from app.feedback.intent_matcher import clear_pending_feedback_cache, get_intent_matcher
+from app.feedback.issue_matcher import get_issue_matcher
+from app.feedback.repair_linkage import get_repair_linkage_service
 from app.schemas.response_feedback_table import ResponseFeedback
 from sqlalchemy.orm import Session
 
@@ -43,10 +62,30 @@ router = APIRouter(prefix="/feedback", tags=["feedback"])
 
 
 
+
 @router.get("/taxonomy", response_model=Dict[str, Any])
 def get_failure_taxonomy() -> Dict[str, Any]:
     """Retrieve the failure taxonomy categories with simple user-friendly labels and tooltips."""
     return {"categories": FAILURE_TAXONOMY}
+
+
+@router.get("/telemetry", response_model=Dict[str, Any])
+def get_feedback_telemetry(
+    current_role: Optional[Role] = Depends(get_client_role),
+    current_user: OptionalCurrentUser = None,
+) -> Dict[str, Any]:
+    """
+    Telemetry dashboard endpoint for feedback status cache hit rate,
+    active entries, invalidations, and reconciliation drift size (Phase 5).
+    """
+    cache = get_feedback_cache()
+    telemetry = cache.get_telemetry()
+    return {
+        "status": "ok",
+        "cache": telemetry,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
 
 
 @router.get("/pending-notice")
@@ -76,12 +115,447 @@ async def get_pending_feedback_notice(
     return {"pending_feedback_notice": notice}
 
 
+@router.get("/status", response_model=FeedbackStatusCheckResponse)
+def get_feedback_status(
+    response_id: Optional[str] = Query(None, description="Response ID to check status for"),
+    query: Optional[str] = Query(None, description="User query text to match"),
+    query_text: Optional[str] = Query(None, description="Alternative parameter for user query text"),
+    tenant_id: Optional[str] = Query(None, description="Tenant ID scope"),
+    db: Session = Depends(get_db),
+    current_role: Optional[Role] = Depends(get_client_role),
+) -> Dict[str, Any]:
+    """
+    Check if query (or response_id) matches an open reported issue.
+    Returns concise, non-blocking status information for rendering in the feedback modal.
+    """
+    effective_query = (query or query_text or "").strip()
+    if not effective_query and response_id:
+        from app.schemas.query_evidence_table import QueryEvidence
+        qe = db.query(QueryEvidence).filter(QueryEvidence.response_id == response_id).first()
+        if qe and qe.query_text:
+            effective_query = qe.query_text.strip()
+        else:
+            rf = db.query(ResponseFeedback).filter(ResponseFeedback.response_id == response_id).first()
+            if rf and rf.query_text:
+                effective_query = rf.query_text.strip()
+
+    if not effective_query:
+        return {"has_existing_issue": False}
+
+    settings = get_settings()
+    cache = get_feedback_cache()
+    if settings.feedback_cache_enabled:
+        cached_res = cache.get(tenant_id, effective_query)
+        if cached_res is not None:
+            if not settings.feedback_category_breakdown_enabled and "category_breakdown" in cached_res:
+                resp = dict(cached_res)
+                resp.pop("category_breakdown", None)
+                return resp
+            return cached_res
+
+    matcher = get_issue_matcher()
+    match = matcher.lookup(query=effective_query, db=db, tenant_id=tenant_id)
+    if not match or not match.matched:
+        miss_res = {"has_existing_issue": False}
+        if settings.feedback_cache_enabled:
+            cache.set(
+                tenant_id,
+                effective_query,
+                miss_res,
+                issue_id=None,
+                ttl_seconds=settings.feedback_cache_ttl_seconds,
+            )
+        return miss_res
+
+    result = {
+        "has_existing_issue": True,
+        "issue_id": match.issue_id,
+        "status": match.status,
+        "message": match.message or "A similar query has already been reported. The issue is pending review or repair.",
+        "match_type": match.match_type,
+        "similarity_score": match.similarity_score,
+        "contributor_count": match.contributor_count or 1,
+    }
+
+    if settings.feedback_category_breakdown_enabled and match.issue_id:
+        breakdown = issue_store.get_issue_category_breakdown(db, match.issue_id, limit=5)
+        result["category_breakdown"] = breakdown
+
+    if settings.feedback_cache_enabled:
+        cache.set(
+            tenant_id,
+            effective_query,
+            result,
+            issue_id=match.issue_id,
+            ttl_seconds=settings.feedback_cache_ttl_seconds,
+        )
+
+    return result
+
+
+
+@router.get("/mine", response_model=MyFeedbackListOut)
+def get_my_feedback(
+    limit: int = Query(50, ge=1, le=200, description="Max items to return"),
+    offset: int = Query(0, ge=0, description="Offset for pagination"),
+    page: Optional[int] = Query(None, ge=1, description="1-indexed page number"),
+    page_size: Optional[int] = Query(None, ge=1, le=200, description="Page size"),
+    q: Optional[str] = Query(None, description="Search term across query, entities, categories, comments"),
+    status: Optional[str] = Query(None, description="Filter by status"),
+    current_user: CurrentUser = None,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Retrieve feedback issues reported or contributed to by the currently authenticated user.
+    Server-side enforced: strictly derived from current_user.username session, never client parameters.
+    Contributors are anonymized (also_reported_by_count) and triage actions are omitted (§3, §4, §7.2).
+    Supports server-side search (q), status filtering, and pagination (Phase 5).
+    """
+    import math
+    from app.schemas.feedback_issues_table import FeedbackIssue
+
+    username = current_user.username
+    tenant_id = current_user.tenant_id
+
+    page_val = page if isinstance(page, int) else None
+    page_size_val = page_size if isinstance(page_size, int) else None
+    limit_val = limit if isinstance(limit, int) else 50
+    offset_val = offset if isinstance(offset, int) else 0
+    q_val = q if isinstance(q, str) else None
+    status_val = status if isinstance(status, str) else None
+
+    effective_limit = page_size_val or limit_val
+    effective_offset = ((page_val - 1) * effective_limit) if page_val else offset_val
+
+    # Query all feedback entries submitted by this user that are linked to an issue
+    user_feedbacks = (
+        db.query(ResponseFeedback)
+        .filter(ResponseFeedback.actor_id == username)
+        .order_by(ResponseFeedback.created_at.desc())
+        .all()
+    )
+
+    feedbacks_by_issue: Dict[str, List[ResponseFeedback]] = {}
+    for fb in user_feedbacks:
+        if fb.issue_id:
+            feedbacks_by_issue.setdefault(fb.issue_id, []).append(fb)
+
+    issue_ids = list(feedbacks_by_issue.keys())
+    if not issue_ids:
+        return {
+            "total": 0,
+            "page": 1,
+            "page_size": effective_limit,
+            "total_pages": 1,
+            "items": [],
+        }
+
+    query = db.query(FeedbackIssue).filter(FeedbackIssue.issue_id.in_(issue_ids))
+    if tenant_id:
+        query = query.filter(
+            (FeedbackIssue.tenant_id == tenant_id) | (FeedbackIssue.tenant_id.is_(None))
+        )
+
+    if status_val and status_val.strip().lower() != "all":
+        query = query.filter(FeedbackIssue.status == status_val.strip().lower())
+
+    all_matched_issues = query.order_by(FeedbackIssue.updated_at.desc()).all()
+
+    # Apply search filter q if provided
+    if q_val and q_val.strip():
+        q_clean = q_val.strip().lower()
+        filtered = []
+        for issue in all_matched_issues:
+            match_canonical = q_clean in (issue.canonical_query_text or "").lower()
+            match_id = q_clean in (issue.issue_id or "").lower()
+            match_entities = any(q_clean in (e or "").lower() for e in (issue.primary_entities or []))
+            # Also check user comments & user categories
+            fbs = feedbacks_by_issue.get(issue.issue_id, [])
+            match_comments = any(q_clean in (fb.feedback_text or "").lower() for fb in fbs)
+            match_cats = False
+            for fb in fbs:
+                cats = fb.categories if fb.categories is not None else fb.selected_categories
+                if isinstance(cats, list) and any(q_clean in (c or "").lower() for c in cats):
+                    match_cats = True
+                    break
+            if match_canonical or match_id or match_entities or match_comments or match_cats:
+                filtered.append(issue)
+        all_matched_issues = filtered
+
+    total = len(all_matched_issues)
+    paged_issues = all_matched_issues[effective_offset : effective_offset + effective_limit]
+    total_pages = max(1, math.ceil(total / effective_limit)) if total > 0 else 1
+    current_page_num = (effective_offset // effective_limit) + 1
+
+    items = []
+    for issue in paged_issues:
+        fbs = feedbacks_by_issue.get(issue.issue_id, [])
+        user_cats = set()
+        user_comments = []
+        for fb in fbs:
+            cats = fb.categories if fb.categories is not None else fb.selected_categories
+            if isinstance(cats, list):
+                for c in cats:
+                    if c:
+                        user_cats.add(c.strip().upper())
+            if fb.feedback_text:
+                user_comments.append(fb.feedback_text)
+
+        items.append({
+            "issue_id": issue.issue_id,
+            "canonical_query_text": issue.canonical_query_text,
+            "status": issue.status,
+            "repair_task_id": issue.repair_task_id,
+            "also_reported_by_count": max(0, issue.contributor_count - 1),
+            "primary_entities": issue.primary_entities or [],
+            "taxonomy_paths": issue.taxonomy_paths or [],
+            "user_reported_categories": sorted(list(user_cats)),
+            "user_feedback_count": len(fbs),
+            "user_feedback_texts": user_comments,
+            "created_at": issue.created_at,
+            "updated_at": issue.updated_at,
+        })
+
+    return {
+        "total": total,
+        "page": current_page_num,
+        "page_size": effective_limit,
+        "total_pages": total_pages,
+        "items": items,
+    }
+
+
+
+@router.post("/reconcile-categories", response_model=Dict[str, Any])
+@require_roles([Role.ADMIN, Role.COMPLIANCE_OFFICER])
+def reconcile_feedback_categories(
+    issue_id: Optional[str] = Query(None, description="Optional single issue_id to reconcile"),
+    db: Session = Depends(get_db),
+    current_role: Role = Depends(get_client_role),
+) -> Dict[str, Any]:
+    """
+    Trigger reconciliation job to recalculate feedback_issue_category_counts from response_feedback records.
+    Guarantees counter consistency against drift (§8).
+    """
+    res = issue_store.reconcile_issue_category_counts(db=db, issue_id=issue_id)
+    return res
+
+
+# ── Issue Lifecycle & Repair Engine Linkage (Phase 3) ─────────────────────────
+
+
+def is_admin_tier_role(user: Optional[Any], client_role: Optional[Role]) -> bool:
+    """
+    Validate that user has an admin-tier role (Admin or Compliance Officer).
+    Checks both token-authenticated session and X-User-Role header.
+    """
+    ADMIN_ROLES = {
+        "admin",
+        "compliance_officer",
+        "compliance & regulatory officer",
+        "compliance officer",
+        "amc_admin",
+        "compliance_lead",
+    }
+    if user:
+        role_clean = (getattr(user, "role", "") or "").strip().lower()
+        if role_clean in ADMIN_ROLES or "admin" in role_clean or "compliance" in role_clean:
+            return True
+        return False
+
+    if client_role in [Role.ADMIN, Role.COMPLIANCE_OFFICER]:
+        return True
+
+    return False
+
+
+@router.post("/issues/{issue_id}/repair", response_model=IssueRepairTransitionResponse)
+def initiate_issue_repair(
+    issue_id: str,
+    payload: Optional[IssueRepairTransitionRequest] = None,
+    db: Session = Depends(get_db),
+    current_role: Optional[Role] = Depends(get_client_role),
+    current_user: OptionalCurrentUser = None,
+) -> Dict[str, Any]:
+    """
+    Transition an issue to 'in_repair' and create or reuse a Repair Engine task (Phase 3).
+    Guarantees idempotency (Section 9):
+    If the issue already has a repair_task_id, reuses it without duplicate creation.
+    """
+    if not is_admin_tier_role(current_user, current_role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Admin-tier role required to initiate repair.",
+        )
+    linkage = get_repair_linkage_service()
+    actor_id = payload.actor_id if payload else None
+    if not actor_id and current_user:
+        actor_id = current_user.username
+    metadata = payload.metadata if payload else None
+    try:
+        result = linkage.get_or_create_repair_task(
+            db=db,
+            issue_id=issue_id,
+            actor_id=actor_id,
+            metadata=metadata,
+        )
+        get_feedback_cache().invalidate_issue(issue_id)
+        return result
+    except ValueError as val_err:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(val_err))
+    except Exception as exc:
+        logger.error("Failed to initiate repair task for issue_id=%s: %s", issue_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to initiate repair task: {str(exc)}",
+        )
+
+
+@router.post("/issues/{issue_id}/status", response_model=IssueRepairTransitionResponse)
+def transition_issue_lifecycle_status(
+    issue_id: str,
+    payload: IssueStatusUpdateRequest,
+    db: Session = Depends(get_db),
+    current_role: Optional[Role] = Depends(get_client_role),
+    current_user: OptionalCurrentUser = None,
+) -> Dict[str, Any]:
+    """
+    Update lifecycle status of a FeedbackIssue (Section 6 & 9).
+    Statuses: reported, under_review, in_repair, resolved, closed, reopened.
+    Transitioning to in_repair automatically links/creates repair_task_id.
+    Transitioning to reopened clears repair_task_id for fresh triage determination.
+    """
+    if not is_admin_tier_role(current_user, current_role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Admin-tier role required to update issue lifecycle.",
+        )
+    linkage = get_repair_linkage_service()
+    actor_id = payload.actor_id or (current_user.username if current_user else None)
+    try:
+        result = linkage.transition_issue_status(
+            db=db,
+            issue_id=issue_id,
+            new_status=payload.status,
+            resolution_notes=payload.resolution_notes,
+            actor_id=actor_id,
+        )
+        get_feedback_cache().invalidate_issue(issue_id)
+        return result
+    except ValueError as val_err:
+        if "not found" in str(val_err).lower():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(val_err))
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(val_err))
+    except Exception as exc:
+        logger.error("Failed to transition status for issue_id=%s: %s", issue_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to transition issue status: {str(exc)}",
+        )
+
+
+@router.get("/issues/{issue_id}", response_model=FeedbackIssueDetailOut)
+def get_feedback_issue(
+    issue_id: str,
+    db: Session = Depends(get_db),
+    current_role: Optional[Role] = Depends(get_client_role),
+    current_user: OptionalCurrentUser = None,
+) -> Dict[str, Any]:
+    """Retrieve full issue metadata, repair task linkage, and linked feedback entries."""
+    if not is_admin_tier_role(current_user, current_role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Admin-tier role required to view issue details.",
+        )
+    linkage = get_repair_linkage_service()
+    details = linkage.get_issue_details(db, issue_id)
+    if not details:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"FeedbackIssue '{issue_id}' not found",
+        )
+    return details
+
+
+@router.get("/issues", response_model=FeedbackIssueListOut)
+def list_feedback_issues(
+    status: Optional[str] = Query(None, description="Filter by status (reported, under_review, in_repair, resolved, closed, reopened)"),
+    tenant_id: Optional[str] = Query(None, description="Filter by tenant ID"),
+    q: Optional[str] = Query(None, description="Search query across query text, issue ID, entities, or repair task ID"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    page: Optional[int] = Query(None, ge=1, description="1-indexed page number"),
+    page_size: Optional[int] = Query(None, ge=1, le=200, description="Page size"),
+    db: Session = Depends(get_db),
+    current_role: Optional[Role] = Depends(get_client_role),
+    current_user: OptionalCurrentUser = None,
+) -> Dict[str, Any]:
+    """List feedback issues with optional status/tenant filtering, server-side search (q), and pagination."""
+    if not is_admin_tier_role(current_user, current_role):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied. Admin-tier role required to view issue triage queue.",
+        )
+
+    import math
+    from app.schemas.feedback_issues_table import FeedbackIssue
+
+    page_val = page if isinstance(page, int) else None
+    page_size_val = page_size if isinstance(page_size, int) else None
+    limit_val = limit if isinstance(limit, int) else 50
+    offset_val = offset if isinstance(offset, int) else 0
+    q_val = q if isinstance(q, str) else None
+    status_val = status if isinstance(status, str) else None
+
+    effective_limit = page_size_val or limit_val
+    effective_offset = ((page_val - 1) * effective_limit) if page_val else offset_val
+
+    query = db.query(FeedbackIssue)
+    if status_val and status_val.strip().lower() != "all":
+        query = query.filter(FeedbackIssue.status == status_val.strip().lower())
+    effective_tenant = tenant_id or (getattr(current_user, "tenant_id", None) if current_user else None)
+    if effective_tenant:
+        query = query.filter(
+            (FeedbackIssue.tenant_id == effective_tenant) | (FeedbackIssue.tenant_id.is_(None))
+        )
+    if q_val and q_val.strip():
+        search_pattern = f"%{q_val.strip()}%"
+        query = query.filter(
+            FeedbackIssue.canonical_query_text.ilike(search_pattern)
+            | FeedbackIssue.issue_id.ilike(search_pattern)
+            | FeedbackIssue.primary_entities.ilike(search_pattern)
+            | FeedbackIssue.repair_task_id.ilike(search_pattern)
+        )
+
+    total = query.count()
+    items_db = query.order_by(FeedbackIssue.created_at.desc()).offset(effective_offset).limit(effective_limit).all()
+    linkage = get_repair_linkage_service()
+    items = []
+    for item in items_db:
+        details = linkage.get_issue_details(db, item.issue_id)
+        if details:
+            items.append(details)
+
+    total_pages = max(1, math.ceil(total / effective_limit)) if total > 0 else 1
+    current_page_num = (effective_offset // effective_limit) + 1
+
+    return {
+        "total": total,
+        "page": current_page_num,
+        "page_size": effective_limit,
+        "total_pages": total_pages,
+        "items": items,
+    }
+
+
+
 @router.post("", response_model=FeedbackOut, status_code=status.HTTP_201_CREATED)
 @require_roles([Role.REVIEWER, Role.COMPLIANCE_OFFICER, Role.ADMIN])
 def submit_feedback(
     payload: FeedbackIn,
     background_tasks: BackgroundTasks,
     current_role: Role = Depends(get_client_role),
+    current_user: OptionalCurrentUser = None,
 ) -> Dict[str, Any]:
 
     """
@@ -95,6 +569,9 @@ def submit_feedback(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Submit at least one category or a comment.",
         )
+
+    # Resolve actor from authenticated session if not explicitly in payload
+    effective_actor_id = payload.actor_id or (current_user.username if current_user else None)
 
     # Cancel active timer if one is running for this query/session
     try:
@@ -115,6 +592,34 @@ def submit_feedback(
 
     db = SessionLocal()
     try:
+        # Contextual Feedback Status Awareness (Phase 1): Match or create FeedbackIssue
+        issue_matcher = get_issue_matcher()
+        effective_query_for_issue = (payload.query_text or "").strip()
+        if not effective_query_for_issue and payload.response_id:
+            from app.schemas.query_evidence_table import QueryEvidence
+            qe = db.query(QueryEvidence).filter(QueryEvidence.response_id == payload.response_id).first()
+            if qe and qe.query_text:
+                effective_query_for_issue = qe.query_text.strip()
+
+        issue_id = None
+        issue_status = None
+        was_matched = False
+        match_type = None
+
+        if effective_query_for_issue:
+            try:
+                issue, m_type, matched = issue_matcher.find_or_create(
+                    query=effective_query_for_issue,
+                    db=db,
+                    actor_id=effective_actor_id,
+                )
+                issue_id = issue.issue_id
+                issue_status = issue.status
+                was_matched = matched
+                match_type = m_type
+            except Exception as match_err:
+                logger.warning("IssueMatcher find_or_create error: %s", match_err)
+
         # Check if feedback already exists for this query/session (handles timer expiration or previous query turns)
         existing = db.query(ResponseFeedback).filter(
             (ResponseFeedback.response_id == payload.response_id) |
@@ -132,15 +637,27 @@ def submit_feedback(
                 payload.session_id,
                 payload.response_id,
             )
+            old_categories = existing.categories if existing.categories is not None else existing.selected_categories
             existing.interaction_id = payload.interaction_id or existing.interaction_id
             existing.session_id = payload.session_id
             existing.turn_number = payload.turn_number or existing.turn_number
-            existing.query_text = payload.query_text or existing.query_text
+            existing.query_text = payload.query_text or existing.query_text or (effective_query_for_issue or None)
             existing.selected_categories = payload.selected_categories
+            existing.categories = payload.selected_categories
             existing.feedback_text = feedback_text_clean if feedback_text_clean else existing.feedback_text
-            existing.actor_id = payload.actor_id or existing.actor_id
+            existing.actor_id = effective_actor_id or existing.actor_id
             existing.actor_role = payload.actor_role or existing.actor_role
             existing.client_timestamp = payload.client_timestamp or existing.client_timestamp
+            if issue_id:
+                existing.issue_id = issue_id
+                existing.match_type = match_type
+                # Atomic category count update in the same transaction (Phase 1)
+                issue_store.record_issue_categories(
+                    db=db,
+                    issue_id=issue_id,
+                    category_codes=payload.selected_categories,
+                    old_category_codes=old_categories,
+                )
             existing.updated_at = now_iso
             db.commit()
             logger.info(
@@ -162,35 +679,53 @@ def submit_feedback(
                 interaction_id=payload.interaction_id,
                 session_id=payload.session_id,
                 turn_number=payload.turn_number,
-                query_text=payload.query_text,
-                actor_id=payload.actor_id,
+                query_text=payload.query_text or effective_query_for_issue or None,
+                actor_id=effective_actor_id,
                 actor_role=payload.actor_role,
                 selected_categories=payload.selected_categories,
+                categories=payload.selected_categories,
                 feedback_text=feedback_text_clean if feedback_text_clean else None,
                 client_timestamp=payload.client_timestamp,
+                issue_id=issue_id,
+                match_type=match_type,
                 created_at=now_iso,
                 updated_at=now_iso,
             )
             db.add(new_feedback)
+            # Atomic category count update in the same transaction (Phase 1)
+            if issue_id and payload.selected_categories:
+                issue_store.record_issue_categories(
+                    db=db,
+                    issue_id=issue_id,
+                    category_codes=payload.selected_categories,
+                )
             db.commit()
             logger.info(
-                "[RECORD_INSERTED] Inserted feedback record into data.db: feedback_id=%s, response_id=%s, session_id=%s",
+                "[RECORD_INSERTED] Inserted feedback record into data.db: feedback_id=%s, response_id=%s, session_id=%s, issue_id=%s",
                 feedback_id,
                 payload.response_id,
                 payload.session_id,
+                issue_id,
             )
 
-        # Invalidate in-memory query notice cache so subsequent checks reflect new submission
+        # Invalidate in-memory query notice cache and status cache so subsequent checks reflect new submission
         try:
             clear_pending_feedback_cache(suppress_prior_feedbacks=False)
-        except Exception:
-            pass
+            if issue_id:
+                get_feedback_cache().invalidate_issue(issue_id)
+        except Exception as cache_err:
+            logger.debug("Failed to clear feedback cache in submit_feedback: %s", cache_err)
         
         result = {
+
             "feedback_id": feedback_id,
             "response_id": payload.response_id,
             "stored_at": now_iso,
             "status": "recorded",
+            "issue_id": issue_id,
+            "issue_status": issue_status,
+            "was_matched_to_existing_issue": was_matched,
+            "match_type": match_type,
         }
 
         # Automatically score feedback quality and assign priority tier
@@ -292,7 +827,10 @@ def get_feedback(
                 "actor_id": fb.actor_id,
                 "actor_role": fb.actor_role,
                 "selected_categories": fb.selected_categories,
+                "categories": fb.categories or fb.selected_categories,
                 "feedback_text": fb.feedback_text,
+                "issue_id": fb.issue_id,
+                "match_type": fb.match_type,
                 "client_timestamp": fb.client_timestamp,
                 "created_at": fb.created_at,
                 "updated_at": fb.updated_at,

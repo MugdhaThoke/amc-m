@@ -41,6 +41,7 @@ class ResponseFeedback(Base):
     actor_role: Mapped[str | None] = mapped_column(String(60), nullable=True, index=True)
 
     selected_categories: Mapped[list] = mapped_column(JSON, nullable=False)
+    categories: Mapped[list | None] = mapped_column(JSON, nullable=True)
     feedback_text: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     answer_relevance_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -87,6 +88,15 @@ class ResponseFeedback(Base):
         nullable=True,
     )
 
+    # --- NEW: Contextual Feedback Status Awareness (Phase 1) ---
+    issue_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("feedback_issues.issue_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    match_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
     __table_args__ = (
         UniqueConstraint("feedback_id", name="uq_response_feedback_id"),
         UniqueConstraint("response_id", "actor_id", name="uq_feedback_response_actor"),
@@ -110,4 +120,5 @@ class ResponseFeedback(Base):
         Index("idx_response_feedback_unified_ref", "unified_record_ref"),
         Index("idx_response_feedback_root_cause", "root_cause"),
         Index("idx_response_feedback_response_text_len", func.length(response_text)),
+        Index("idx_response_feedback_issue_id", "issue_id"),
     )

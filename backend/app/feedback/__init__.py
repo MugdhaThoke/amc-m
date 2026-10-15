@@ -29,6 +29,21 @@ from app.feedback.intent_matcher import (
     get_intent_matcher,
     clear_pending_feedback_cache,
 )
+from app.feedback.issue_matcher import (
+    IssueMatcher,
+    IssueMatchResult,
+    get_issue_matcher,
+    reset_issue_matcher,
+)
+from app.feedback import issue_store
+from app.feedback.repair_linkage import (
+    RepairLinkageService,
+    get_repair_linkage_service,
+)
+from app.feedback.feedback_cache import (
+    FeedbackStatusCache,
+    get_feedback_cache,
+)
 
 __all__ = [
     "DissatisfactionDetector",
@@ -54,4 +69,15 @@ __all__ = [
     "FeedbackIntentMatcher",
     "get_intent_matcher",
     "clear_pending_feedback_cache",
+    "IssueMatcher",
+    "IssueMatchResult",
+    "get_issue_matcher",
+    "reset_issue_matcher",
+    "issue_store",
+    "RepairLinkageService",
+    "get_repair_linkage_service",
+    "FeedbackStatusCache",
+    "get_feedback_cache",
 ]
+
+

@@ -31,6 +31,12 @@ class TestSqlUserRepository:
         """Test creating a Compliance Officer user."""
         repo = SqlUserRepository()
         
+        # Clean up if existing
+        existing = db_session.query(AuthUser).filter_by(username="compliance_test").first()
+        if existing:
+            db_session.delete(existing)
+            db_session.commit()
+
         # Create user
         user = repo.create_user(
             db=db_session,
@@ -57,7 +63,12 @@ class TestSqlUserRepository:
 
     def test_get_by_username(self, db_session, sql_repo):
         """Test retrieving user by username."""
-        # Create a user directly
+        # Create a user directly (cleaning up existing if present)
+        existing = db_session.query(AuthUser).filter_by(username="sarah.compliance").first()
+        if existing:
+            db_session.delete(existing)
+            db_session.commit()
+
         user = AuthUser(
             username="sarah.compliance",
             password_hash=hash_password("Compliance@2026"),
@@ -81,6 +92,11 @@ class TestSqlUserRepository:
 
     def test_get_by_username_case_insensitive(self, db_session, sql_repo):
         """Test case-insensitive username lookup."""
+        existing = db_session.query(AuthUser).filter_by(username="testuser").first()
+        if existing:
+            db_session.delete(existing)
+            db_session.commit()
+
         # Create a user
         user = AuthUser(
             username="testuser",
@@ -107,6 +123,12 @@ class TestSqlUserRepository:
 
     def test_get_all_users(self, db_session, sql_repo):
         """Test retrieving all users."""
+        for i in range(3):
+            existing = db_session.query(AuthUser).filter_by(username=f"testuser{i}").first()
+            if existing:
+                db_session.delete(existing)
+        db_session.commit()
+
         # Create test users
         for i in range(3):
             user = AuthUser(
@@ -136,6 +158,11 @@ class TestComplianceOfficerLogin:
     @pytest.fixture(autouse=True)
     def setup_compliance_officer(self, db_session):
         """Create a compliance officer user before each test."""
+        existing = db_session.query(AuthUser).filter_by(username="compliance_officer").first()
+        if existing:
+            db_session.delete(existing)
+            db_session.commit()
+
         user = AuthUser(
             username="compliance_officer",
             password_hash=hash_password("Compliance@2026"),
@@ -233,6 +260,11 @@ class TestComplianceOfficerQueries:
     @pytest.fixture(autouse=True)
     def setup_compliance_officer(self, db_session):
         """Create a compliance officer user."""
+        existing = db_session.query(AuthUser).filter_by(username="compliance_officer").first()
+        if existing:
+            db_session.delete(existing)
+            db_session.commit()
+
         user = AuthUser(
             username="compliance_officer",
             password_hash=hash_password("Compliance@2026"),

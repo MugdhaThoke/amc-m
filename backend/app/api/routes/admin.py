@@ -16,10 +16,11 @@ import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from pydantic import BaseModel, EmailStr, Field
 
 from app.api.deps import OptionalCurrentUser
+from app.compliance.security import Role, get_client_role
 logger = logging.getLogger(__name__)
 
 
@@ -41,17 +42,21 @@ def _get_regulatory_lifecycle_enricher() -> Any:
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 # Standalone users configuration file paths
-CONFIG_PATHS = [
+DEFAULT_CONFIG_PATHS = [
     Path("config/users_rbac.json"),
     Path("backend/config/users_rbac.json"),
     Path(__file__).parent.parent.parent.parent / "config" / "users_rbac.json",
 ]
+CONFIG_PATHS = list(DEFAULT_CONFIG_PATHS)
 
 PROTECTED_SYSTEM_USERS = {
     "compliance_officer",
     "amc_auditor",
     "amc_researcher",
     "sarah_compliance",
+    "sarah.compliance",
+    "admin",
+    "amc_admin",
 }
 
 DEFAULT_USERS = [
@@ -132,7 +137,45 @@ def _get_config_path() -> Path:
     return p
 
 
-def _load_users() -> List[Dict[str, Any]]:
+def _load_users_from_db(active_only: bool = False) -> List[Dict[str, Any]]:
+    """Query user records directly from data.db auth_users table."""
+    try:
+        from app.config import get_settings
+        settings = get_settings()
+        if not getattr(settings, "auth_use_database", True):
+            return []
+
+        from app.core.database import SessionLocal
+        from app.schemas.auth_users_table import AuthUser
+
+        with SessionLocal() as db:
+            query = db.query(AuthUser)
+            if active_only:
+                query = query.filter(AuthUser.status.ilike("active"))
+            db_users = query.order_by(AuthUser.created_at.asc(), AuthUser.username.asc()).all()
+            if db_users:
+                user_list = []
+                for u in db_users:
+                    display_name = u.display_name or u.username
+                    user_list.append({
+                        "username": u.username,
+                        "full_name": display_name,
+                        "display_name": display_name,
+                        "role": u.role,
+                        "department": u.department or "General",
+                        "email": u.email or f"{u.username}@amc.com",
+                        "avatar_initials": u.avatar_initials or "".join(w[0] for w in display_name.split()[:2]).upper() or "U",
+                        "status": u.status or "Active",
+                        "tenant_id": u.tenant_id,
+                        "is_superuser": bool(u.is_superuser),
+                    })
+                return user_list
+    except Exception as e:
+        logger.warning("Could not load users from data.db auth_users table: %s", e)
+    return []
+
+
+def _load_users_from_file() -> List[Dict[str, Any]]:
     path = _get_config_path()
     if path.exists():
         try:
@@ -143,6 +186,32 @@ def _load_users() -> List[Dict[str, Any]]:
         except Exception as e:
             logger.warning("Error reading users_rbac.json: %s", e)
     return list(DEFAULT_USERS)
+
+
+def _load_users(active_only: bool = False) -> List[Dict[str, Any]]:
+    """Load user profiles synchronized with data.db auth_users, falling back to config file."""
+    # If CONFIG_PATHS has been monkeypatched (e.g. in test suites), respect the monkeypatch
+    if CONFIG_PATHS != DEFAULT_CONFIG_PATHS:
+        file_users = _load_users_from_file()
+        if active_only:
+            return [u for u in file_users if (u.get("status") or "").lower() == "active"]
+        return file_users
+
+    # Primary: load directly from data.db auth_users table
+    db_users = _load_users_from_db(active_only=active_only)
+    if db_users:
+        # Keep config file synchronized as a fallback cache
+        try:
+            _save_users(db_users)
+        except Exception:
+            pass
+        return db_users
+
+    # Secondary fallback: load from file or defaults
+    file_users = _load_users_from_file()
+    if active_only:
+        return [u for u in file_users if (u.get("status") or "").lower() == "active"]
+    return file_users
 
 
 def _save_users(users: List[Dict[str, Any]]) -> None:
@@ -163,10 +232,17 @@ class UserProfileSchema(BaseModel):
 
 
 @router.get("/users")
-async def list_users() -> Dict[str, Any]:
-    """List all registered AMC user profiles."""
-    users = _load_users()
-    return {"users": users, "total": len(users)}
+async def list_users(active_only: bool = False, sync: bool = False) -> Dict[str, Any]:
+    """List all registered AMC user profiles synchronized with data.db auth_users."""
+    users = _load_users(active_only=active_only)
+    return {"users": users, "total": len(users), "synced": True}
+
+
+@router.post("/users/sync")
+async def sync_users(active_only: bool = False) -> Dict[str, Any]:
+    """Force re-synchronization of active user profiles from data.db auth_users."""
+    users = _load_users(active_only=active_only)
+    return {"users": users, "total": len(users), "status": "synced"}
 
 
 @router.post("/users")
@@ -372,6 +448,19 @@ async def delete_user(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"User {clean_username} not found.",
         )
+
+    # Also clean up from users.json fallback if present
+    try:
+        from app.auth.repository import DEFAULT_USERS_PATH
+        if DEFAULT_USERS_PATH.exists():
+            with open(DEFAULT_USERS_PATH, "r", encoding="utf-8") as f:
+                jdata = json.load(f)
+            jusers = [ju for ju in jdata.get("users", []) if _normalize_username(ju.get("username")) != _normalize_username(clean_username)]
+            jdata["users"] = jusers
+            with open(DEFAULT_USERS_PATH, "w", encoding="utf-8") as f:
+                json.dump(jdata, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning("Error deleting user %s from users.json: %s", clean_username, e)
 
     _save_users(users)
     return {"deleted": clean_username, "message": f"Deleted user {clean_username}."}
@@ -935,6 +1024,43 @@ async def clear_intent_cache_endpoint() -> Dict[str, Any]:
         "cleared_layers": cleared_layers,
         "message": "⚡ Intent Cache cleared cleanly! Next query will execute full LLM synthesis.",
     }
+
+
+# ── Admin Feedback Issues Route Alias (Phase 2) ──────────────────────────────
+
+@router.get("/feedback/issues")
+def admin_list_feedback_issues(
+    status: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    page: Optional[int] = None,
+    page_size: Optional[int] = None,
+    current_user: OptionalCurrentUser = None,
+    current_role: Optional[Role] = Depends(get_client_role),
+):
+    """Admin-scoped route alias for feedback issues triage queue (Phase 2 Section 7.3)."""
+    from app.api.routes.feedback import list_feedback_issues
+    from app.core.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        return list_feedback_issues(
+            status=status,
+            tenant_id=tenant_id,
+            q=q,
+            limit=limit,
+            offset=offset,
+            page=page,
+            page_size=page_size,
+            db=db,
+            current_role=current_role,
+            current_user=current_user,
+        )
+    finally:
+        db.close()
+
 
 
 

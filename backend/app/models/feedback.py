@@ -34,6 +34,29 @@ class FeedbackOut(BaseModel):
     status: str = "recorded"
     priority_tier: Optional[str] = None
     signal_quality_score: Optional[float] = None
+    issue_id: Optional[str] = None
+    issue_status: Optional[str] = None
+    was_matched_to_existing_issue: Optional[bool] = False
+    match_type: Optional[str] = None
+
+
+class CategoryBreakdownItem(BaseModel):
+    code: str
+    label: str
+    count: int
+
+
+class FeedbackStatusCheckResponse(BaseModel):
+    has_existing_issue: bool
+    issue_id: Optional[str] = None
+    status: Optional[str] = None
+    message: Optional[str] = None
+    match_type: Optional[str] = None
+    similarity_score: Optional[float] = None
+    contributor_count: Optional[int] = None
+    category_breakdown: Optional[list[CategoryBreakdownItem]] = None
+    cached: Optional[bool] = False
+
 
 
 class PendingFeedbackNotice(BaseModel):
@@ -45,4 +68,74 @@ class PendingFeedbackNotice(BaseModel):
     repair_lifecycle_status: str = Field(default="open", description="Lifecycle status: open, diagnosing")
     match_count: int = Field(default=1, ge=1, description="Number of matching feedback entries with pending repairs")
     suppressed_by_cache_clear: bool = Field(default=False, description="True if suppressed due to intent cache clear")
+
+
+class IssueRepairTransitionRequest(BaseModel):
+    actor_id: Optional[str] = Field(default=None, description="Reviewer or triage actor initiating repair")
+    metadata: Optional[dict] = Field(default=None, description="Optional extra triage metadata")
+
+
+class IssueRepairTransitionResponse(BaseModel):
+    issue_id: str
+    repair_task_id: Optional[str] = None
+    status: str
+    task_created: bool
+    reused: bool
+    message: str
+
+
+class IssueStatusUpdateRequest(BaseModel):
+    status: str = Field(..., description="Target status: reported, under_review, in_repair, resolved, closed, reopened")
+    resolution_notes: Optional[str] = Field(default=None, description="Resolution or closing justification")
+    actor_id: Optional[str] = Field(default=None, description="Actor initiating transition")
+
+
+class FeedbackIssueDetailOut(BaseModel):
+    issue_id: str
+    canonical_query_text: str
+    query_hash: str
+    status: str
+    repair_task_id: Optional[str] = None
+    contributor_count: int
+    primary_entities: list[str] = Field(default_factory=list)
+    taxonomy_paths: list[str] = Field(default_factory=list)
+    tenant_id: Optional[str] = None
+    created_at: str
+    updated_at: str
+    resolution_notes: Optional[str] = None
+    linked_feedback_count: int = 0
+    linked_feedback_ids: list[str] = Field(default_factory=list)
+
+
+class FeedbackIssueListOut(BaseModel):
+    total: int
+    page: Optional[int] = 1
+    page_size: Optional[int] = 50
+    total_pages: Optional[int] = 1
+    items: list[FeedbackIssueDetailOut]
+
+
+class MyFeedbackItemOut(BaseModel):
+    issue_id: str
+    canonical_query_text: str
+    status: str
+    repair_task_id: Optional[str] = None
+    also_reported_by_count: int = 0
+    primary_entities: list[str] = Field(default_factory=list)
+    taxonomy_paths: list[str] = Field(default_factory=list)
+    user_reported_categories: list[str] = Field(default_factory=list)
+    user_feedback_count: int = 1
+    user_feedback_texts: list[str] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+
+
+class MyFeedbackListOut(BaseModel):
+    total: int
+    page: Optional[int] = 1
+    page_size: Optional[int] = 50
+    total_pages: Optional[int] = 1
+    items: list[MyFeedbackItemOut]
+
+
 
