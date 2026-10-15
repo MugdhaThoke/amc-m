@@ -36,7 +36,10 @@ TAXONOMY_SOURCE_DIRS = [AMFI_DIR, SUBCLASS_DIR, CORPUS_DIR]
 FAISS_DIR      = PROJECT_ROOT / "faiss_indexes"
 LOG_DIR        = PROJECT_ROOT / "logs"
 for d in (FAISS_DIR, LOG_DIR, TAXONOMY_BACKUP_DIR):
-    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 # S3 bucket new source documents are uploaded to (reindex_from_s3.py syncs
 # this into DATA_DIR before running build_index). Empty = sync step skipped.
@@ -74,7 +77,10 @@ GROQ_VISION_RPM = int(os.environ.get("GROQ_VISION_RPM", "50"))
 SMART_EXTRACTION = os.environ.get("SMART_EXTRACTION", "true").lower() == "true"
 LOCAL_TEXT_SUFFICIENCY_THRESHOLD = int(os.environ.get("LOCAL_TEXT_SUFFICIENCY_THRESHOLD", "400"))
 EXTRACTION_CACHE_DIR = PROJECT_ROOT / "logs" / "extraction_cache"
-EXTRACTION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    EXTRACTION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
 # ── VERTEX / GEMINI (same pattern as faiss_store._get_gemini_client) ─────
 VERTEX_KEY_PATH  = PROJECT_ROOT / "vertex_key.json"
@@ -156,7 +162,10 @@ AMFI_MONTHLY_AUM_URL = os.environ.get("AMFI_MONTHLY_AUM_URL", "https://www.amfii
 # Member portal inbox directory (Channel C: folder watcher)
 MEMBER_PORTAL_INBOX = Path(os.environ.get("MEMBER_PORTAL_INBOX", 
                                            str(PROJECT_ROOT / "data" / "member_inbox")))
-MEMBER_PORTAL_INBOX.mkdir(parents=True, exist_ok=True)
+try:
+    MEMBER_PORTAL_INBOX.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
 # Taxonomy/retrieval configuration
 RETRIEVAL_ACTIVE_ONLY = os.environ.get("RETRIEVAL_ACTIVE_ONLY", "true").lower() == "true"

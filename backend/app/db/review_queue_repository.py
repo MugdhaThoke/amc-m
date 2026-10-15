@@ -54,9 +54,12 @@ class ReviewQueueRepository:
             if isinstance(db_or_path, str):
                 self._db_path = db_or_path
             else:
-                db_dir = Path(__file__).resolve().parent.parent / "data"
-                db_dir.mkdir(parents=True, exist_ok=True)
-                self._db_path = str(db_dir / "review_queue.db")
+                try:
+                    db_dir = Path(__file__).resolve().parent.parent / "data"
+                    db_dir.mkdir(parents=True, exist_ok=True)
+                    self._db_path = str(db_dir / "review_queue.db")
+                except Exception:
+                    self._db_path = ":memory:"
 
             self._init_sqlite()
 

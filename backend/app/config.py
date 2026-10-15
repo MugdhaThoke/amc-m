@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     passive_session_max_size: int = 10000             # max sessions stored in memory
     passive_enrichment_batch_size: int = 100          # max responses enriched per cycle
     feedback_timer_seconds: int = 300                 # 5-minute timer before auto-inserting empty feedback
+    feedback_category_breakdown_enabled: bool = True  # Enable category breakdown in feedback status banner (Phase 1)
+    feedback_cache_enabled: bool = True               # Enable short-TTL status cache (Phase 5)
+    feedback_cache_ttl_seconds: float = 10.0          # TTL in seconds for feedback status cache (Phase 5)
 
     # ── Microservices Configuration ──────────────────────────────
     microservices_mode: bool = Field(

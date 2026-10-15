@@ -22,6 +22,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import faiss
@@ -44,11 +45,17 @@ class VectorStore:
         if faiss_dir:
             self._dir = faiss_dir
         else:
-            version_dir = os.path.join("./data/vector_store", self._corpus_version)
-            if os.path.exists(version_dir) or not os.path.exists(settings.faiss_dir):
-                self._dir = version_dir
-            else:
-                self._dir = settings.faiss_dir
+            candidates = [
+                os.path.join("./data/vector_store", self._corpus_version),
+                os.path.join(str(Path(__file__).resolve().parent.parent.parent / "data" / "vector_store"), self._corpus_version),
+                os.path.join(str(Path(__file__).resolve().parent.parent.parent.parent / "data" / "vector_store"), self._corpus_version),
+                settings.faiss_dir,
+            ]
+            self._dir = candidates[0]
+            for cand in candidates:
+                if os.path.exists(cand) and os.path.exists(os.path.join(cand, "index.faiss")):
+                    self._dir = cand
+                    break
 
         self._index_path = os.path.join(self._dir, "index.faiss")
         self._payload_path = os.path.join(self._dir, "payloads.json")
@@ -64,23 +71,33 @@ class VectorStore:
         return faiss.IndexIDMap2(faiss.IndexFlatIP(self._dim))
 
     def ensure_collection(self) -> None:
-        os.makedirs(self._dir, exist_ok=True)
+        try:
+            os.makedirs(self._dir, exist_ok=True)
+        except Exception as exc:
+            logger.warning("Could not create vector store dir %s: %s", self._dir, exc)
+
         if os.path.exists(self._index_path) and os.path.exists(self._payload_path):
-            raw_idx = faiss.read_index(self._index_path)
-            if not isinstance(raw_idx, (faiss.IndexIDMap, faiss.IndexIDMap2)):
-                n = raw_idx.ntotal
-                d = raw_idx.d
-                vecs = np.zeros((n, d), dtype="float32")
-                raw_idx.reconstruct_n(0, n, vecs)
-                self._index = faiss.IndexIDMap2(faiss.IndexFlatIP(d))
-                ids = np.arange(n, dtype="int64")
-                self._index.add_with_ids(vecs, ids)
-            else:
-                self._index = raw_idx
-            with open(self._payload_path, "r", encoding="utf-8") as f:
-                self._payloads = {int(k): v for k, v in json.load(f).items()}
-            self._next_id = (max(self._payloads) + 1) if self._payloads else 0
-            logger.info("Loaded FAISS index (%d vectors) from %s", self._index.ntotal, self._dir)
+            try:
+                raw_idx = faiss.read_index(self._index_path)
+                if not isinstance(raw_idx, (faiss.IndexIDMap, faiss.IndexIDMap2)):
+                    n = raw_idx.ntotal
+                    d = raw_idx.d
+                    vecs = np.zeros((n, d), dtype="float32")
+                    raw_idx.reconstruct_n(0, n, vecs)
+                    self._index = faiss.IndexIDMap2(faiss.IndexFlatIP(d))
+                    ids = np.arange(n, dtype="int64")
+                    self._index.add_with_ids(vecs, ids)
+                else:
+                    self._index = raw_idx
+                with open(self._payload_path, "r", encoding="utf-8") as f:
+                    self._payloads = {int(k): v for k, v in json.load(f).items()}
+                self._next_id = (max(self._payloads) + 1) if self._payloads else 0
+                logger.info("Loaded FAISS index (%d vectors) from %s", self._index.ntotal, self._dir)
+            except Exception as exc:
+                logger.warning("Failed to load FAISS index or payloads from %s: %s. Re-initializing empty.", self._dir, exc)
+                self._index = None
+                self._payloads = {}
+                self._next_id = 0
 
         # Auto-hydrate from amc_master baseline if index is empty or unpopulated
         if self._index is None or self._index.ntotal == 0 or len(self._payloads) == 0:
@@ -142,13 +159,18 @@ class VectorStore:
                 self._index = self._new_index()
                 self._payloads = {}
                 self._next_id = 0
-                logger.info("Initialized empty FAISS index at %s", self._dir)
+                logger.info("Initialized empty in-memory FAISS index at %s", self._dir)
 
     def _persist(self) -> None:
-        os.makedirs(self._dir, exist_ok=True)
-        faiss.write_index(self._index, self._index_path)
-        with open(self._payload_path, "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in self._payloads.items()}, f)
+        if self._index is None:
+            return
+        try:
+            os.makedirs(self._dir, exist_ok=True)
+            faiss.write_index(self._index, self._index_path)
+            with open(self._payload_path, "w", encoding="utf-8") as f:
+                json.dump({str(k): v for k, v in self._payloads.items()}, f)
+        except Exception as exc:
+            logger.warning("Could not persist FAISS index to %s: %s", self._dir, exc)
 
     def ping(self) -> bool:
         return self._index is not None

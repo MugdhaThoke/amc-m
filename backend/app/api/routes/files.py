@@ -45,6 +45,7 @@ SEARCH_DIRS: List[Path] = [
     _REPO_ROOT / "data",
     _BACKEND_ROOT / "app" / "engine" / "data",
     _BACKEND_ROOT / "data",
+    _BACKEND_ROOT / "data" / "source_docs",
     engine_config.DATA_DIR,
 ]
 

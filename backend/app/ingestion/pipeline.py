@@ -65,16 +65,28 @@ class IngestionPipeline:
         self._ledger = IngestionLedger(corpus_version=self._corpus_version)
 
     async def ingest_file(self, path: Path) -> Document:
+        path = Path(path)
         logger.info("Ingesting %s (corpus_version=%s)", path.name, self._corpus_version)
 
+        raw_bytes = path.read_bytes()
+        content_sha = compute_content_sha256(raw_bytes)
+
         # Use posix path representation to prevent collisions between different subdirectories
-        source_rel_path = path.as_posix() if isinstance(path, Path) else str(path).replace("\\", "/")
+        source_rel_path = path.as_posix()
         source_id = generate_source_id(source_rel_path, namespace="corpus")
         doc_id = generate_document_id(source_id)
         doc_ver_id = generate_document_version_id(doc_id, content_sha)
 
         if self._ledger.is_activated(doc_ver_id):
             logger.info("Document version %s already activated in ledger, skipping duplicate ingest", doc_ver_id)
+            parser = self._registry.get(path)
+            document = parser.parse(path)
+            document.document_id = doc_id
+            document.source_id = source_id
+            document.content_sha256 = content_sha
+            document.document_version_id = doc_ver_id
+            document.corpus_version = self._corpus_version
+            return document
 
         # 1. Parse into unified schema
         parser = self._registry.get(path)

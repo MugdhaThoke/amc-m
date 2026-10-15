@@ -48,6 +48,13 @@ def init_db():
         logging.getLogger("app.core.database").warning("Failed to run user ownership migration: %s", e)
 
     try:
+        from scripts.migrate_feedback_issues import run_migration as run_feedback_issues_migration
+        run_feedback_issues_migration(BASE_DIR / "data.db")
+    except Exception as e:
+        import logging
+        logging.getLogger("app.core.database").warning("Failed to run feedback issues migration: %s", e)
+
+    try:
         from app.db.migrate_data import populate_data_db
         populate_data_db()
     except Exception as e:

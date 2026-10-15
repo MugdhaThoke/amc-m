@@ -8,6 +8,7 @@
 import asyncio
 import json
 import logging
+import re
 from typing import Any, AsyncGenerator, Optional
 import httpx
 
@@ -225,14 +226,18 @@ class LLMClient:
         model = self._settings.llm_fast_model if fast else self._settings.llm_model
         messages = []
         if structured_schema:
-            sys_text = (system + "\n\nYou must output a valid JSON object.") if system else "You must output a valid JSON object."
+            sys_text = (
+                (system + "\n\nYou must return ONLY a raw valid JSON object. Do NOT wrap in markdown code blocks or ```json. Do NOT include any explanations, preamble, or trailing text. The output MUST start with '{' and end with '}'.")
+                if system
+                else "You must return ONLY a raw valid JSON object. Do NOT wrap in markdown code blocks or ```json. Do NOT include any explanations, preamble, or trailing text. The output MUST start with '{' and end with '}'."
+            )
             messages.append({"role": "system", "content": sys_text})
         elif system:
             messages.append({"role": "system", "content": system})
         
         user_content = prompt
         if structured_schema:
-            user_content += f"\n\nRespond strictly with a valid JSON object matching this schema:\n{json.dumps(structured_schema)}"
+            user_content += f"\n\nRespond strictly with a valid JSON object matching this schema:\n{json.dumps(structured_schema)}\nReturn ONLY the raw JSON object starting with '{{' and ending with '}}'."
         messages.append({"role": "user", "content": user_content})
 
         default_tokens = 2500 if fast else (self._settings.llm_max_tokens or 4096)
@@ -245,16 +250,32 @@ class LLMClient:
         if structured_schema:
             kwargs["response_format"] = {"type": "json_object"}
 
-        async with self._semaphore:
-            try:
-                response = await self._groq_client.chat.completions.create(**kwargs)
-                return response.choices[0].message.content or ""
-            except groq.RateLimitError as exc:
-                raise UpstreamError("Groq rate limited after retries") from exc
-            except groq.APIStatusError as exc:
-                raise UpstreamError(f"Groq API error {exc.status_code}: {exc.message}") from exc
-            except groq.APIConnectionError as exc:
-                raise UpstreamError("Groq connection error") from exc
+        delays = [2.0, 5.0, 10.0]
+        for attempt in range(len(delays) + 1):
+            async with self._semaphore:
+                try:
+                    response = await self._groq_client.chat.completions.create(**kwargs)
+                    return response.choices[0].message.content or ""
+                except groq.RateLimitError as exc:
+                    if attempt >= len(delays):
+                        raise UpstreamError("Groq rate limited after retries") from exc
+                    backoff = delays[attempt]
+                    logger.warning("Groq rate limited (attempt %d/%d). Sleeping %.1fs before retrying...", attempt + 1, len(delays), backoff)
+                    await asyncio.sleep(backoff)
+                    continue
+                except groq.APIStatusError as exc:
+                    if exc.status_code == 400 and "json_validate_failed" in getattr(exc, "message", str(exc)):
+                        logger.info("Groq json_validate_failed; retrying without response_format constraint")
+                        kwargs_retry = dict(kwargs)
+                        kwargs_retry.pop("response_format", None)
+                        try:
+                            response = await self._groq_client.chat.completions.create(**kwargs_retry)
+                            return response.choices[0].message.content or "{}"
+                        except Exception as retry_exc:
+                            raise UpstreamError(f"Groq API error {exc.status_code}: {exc.message}") from retry_exc
+                    raise UpstreamError(f"Groq API error {exc.status_code}: {exc.message}") from exc
+                except groq.APIConnectionError as exc:
+                    raise UpstreamError("Groq connection error") from exc
 
     async def _call_openai(
         self,
@@ -348,15 +369,27 @@ class LLMClient:
 
     def _parse_json(self, text: str) -> dict:
         clean = text.strip()
-        if clean.startswith("```json"):
-            clean = clean[7:]
-        if clean.endswith("```"):
-            clean = clean[:-3]
-        clean = clean.strip()
+        if "```" in clean:
+            match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", clean)
+            if match:
+                clean = match.group(1).strip()
+        first_brace = clean.find("{")
+        last_brace = clean.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            clean = clean[first_brace : last_brace + 1]
         try:
             return json.loads(clean)
-        except json.JSONDecodeError as exc:
-            raise UpstreamError("LLM returned unparseable JSON", {"raw": text[:500]}) from exc
+        except json.JSONDecodeError:
+            first_bracket = clean.find("[")
+            last_bracket = clean.rfind("]")
+            if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
+                try:
+                    parsed_list = json.loads(clean[first_bracket : last_bracket + 1])
+                    return {"entities": parsed_list, "relationships": parsed_list}
+                except Exception:
+                    pass
+            logger.warning("LLM returned unparseable JSON (first 300 chars: %r)", text[:300])
+            return {}
 
     async def ping(self) -> bool:
         try:

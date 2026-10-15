@@ -180,22 +180,39 @@ class RelationshipExtractor:
         existing_keys = {
             (r.relationship_type.value, s.lower(), t.lower()) for r, s, t in existing
         }
+        rel_list = (
+            result.get("relationships", [])
+            if isinstance(result, dict)
+            else (result if isinstance(result, list) else [])
+        )
         results: list[tuple[Relationship, str, str]] = []
-        for raw in result.get("relationships", []):
-            source = by_name.get(raw["source"].lower())
-            target = by_name.get(raw["target"].lower())
+        for raw in rel_list:
+            if not isinstance(raw, dict):
+                continue
+            src_str = str(raw.get("source") or "").lower()
+            tgt_str = str(raw.get("target") or "").lower()
+            source = by_name.get(src_str)
+            target = by_name.get(tgt_str)
             if not source or not target:
                 continue
-            key = (raw["type"], source.name.lower(), target.name.lower())
+            rel_type_str = str(raw.get("type") or "RELATED_TO").upper()
+            try:
+                rel_type = RelationshipType(rel_type_str)
+            except ValueError:
+                continue
+            key = (rel_type.value, source.name.lower(), target.name.lower())
             if key in existing_keys:
                 continue
             existing_keys.add(key)
+            props = raw.get("properties", {})
+            if not isinstance(props, dict):
+                props = {}
             results.append((
                 Relationship(
-                    relationship_type=RelationshipType(raw["type"]),
+                    relationship_type=rel_type,
                     source_entity_id=source.entity_id,
                     target_entity_id=target.entity_id,
-                    properties=raw.get("properties", {}),
+                    properties=props,
                     extraction_method="llm",
                     confidence=min(float(raw.get("confidence", 0.75)), 0.90),
                 ),

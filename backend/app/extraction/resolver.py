@@ -64,16 +64,19 @@ class EntityResolver:
         if not path.exists():
             logger.warning("Alias seed file not found: %s", path)
             return
-        data = json.loads(path.read_text(encoding="utf-8"))
-        for item in data.get("entities", []):
-            entity_type = EntityType(item["entity_type"])
-            cls = ENTITY_CLASS_BY_TYPE[entity_type]
-            entity = cls(
-                name=item["canonical_name"],
-                entity_type=entity_type,
-                aliases=item.get("aliases", []),
-            )
-            self._register(entity)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for item in data.get("entities", []):
+                entity_type = EntityType(item["entity_type"])
+                cls = ENTITY_CLASS_BY_TYPE[entity_type]
+                entity = cls(
+                    name=item["canonical_name"],
+                    entity_type=entity_type,
+                    aliases=item.get("aliases", []),
+                )
+                self._register(entity)
+        except Exception as exc:
+            logger.warning("Failed to parse alias seed from %s: %s", path, exc)
 
     def _register(self, entity: BaseEntity) -> None:
         self._canonical[entity.name.lower()] = entity
@@ -160,8 +163,11 @@ class EntityResolver:
                 logger.warning("Disambiguation failed for %s: %s", mention.surface_form, exc)
 
         # Genuinely new entity
-        entity_type = EntityType(mention.type)
-        cls = ENTITY_CLASS_BY_TYPE[entity_type]
+        try:
+            entity_type = EntityType(mention.type)
+        except ValueError:
+            entity_type = EntityType.DOCUMENT
+        cls = ENTITY_CLASS_BY_TYPE.get(entity_type, BaseEntity)
         entity = cls(
             name=mention.normalized_name,
             entity_type=entity_type,

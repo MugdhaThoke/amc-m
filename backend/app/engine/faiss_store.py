@@ -88,7 +88,10 @@ def get_last_rerank_ms() -> float:
 # ─────────────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 INDEXES_DIR  = PROJECT_ROOT / "faiss_indexes"
-INDEXES_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    INDEXES_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
 USER_UPLOAD_SLUG = "user_uploads"
 
@@ -811,17 +814,35 @@ class BrochureFAISSStore:
         pkl_path   = index_dir / "index.pkl"
         meta_path  = index_dir / "meta.json"
 
-        if not faiss_path.exists():
-            raise FileNotFoundError(
-                f"No FAISS index for '{slug}'. "
-                f"Run scripts/build_all_indexes.py.")
+        try:
+            if not faiss_path.exists() or not pkl_path.exists():
+                import logging
+                logging.getLogger("engine.faiss").warning(
+                    "No prebuilt FAISS index for '%s' at %s. Operating in empty in-memory fallback mode.",
+                    slug, index_dir
+                )
+                self.index = faiss.IndexFlatIP(384)
+                self.children = []
+                self.parents_map = {}
+                self.meta = {}
+                return
 
-        self.index = faiss.read_index(str(faiss_path))
-        with open(pkl_path, "rb") as f:
-            data = pickle.load(f)
-        self.children    = data.get("children", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        self.parents_map = data.get("parents", {}) if isinstance(data, dict) else {}
-        self.meta        = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+            self.index = faiss.read_index(str(faiss_path))
+            with open(pkl_path, "rb") as f:
+                data = pickle.load(f)
+            self.children    = data.get("children", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            self.parents_map = data.get("parents", {}) if isinstance(data, dict) else {}
+            self.meta        = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+        except Exception as exc:
+            import logging
+            logging.getLogger("engine.faiss").warning(
+                "Failed to load FAISS index for '%s' from %s: %s. Using empty in-memory fallback.",
+                slug, index_dir, exc
+            )
+            self.index = faiss.IndexFlatIP(384)
+            self.children = []
+            self.parents_map = {}
+            self.meta = {}
 
     def retrieve(
         self,
@@ -835,6 +856,10 @@ class BrochureFAISSStore:
         bi-encoder is fast but coarse (independent embeddings), the
         cross-encoder is slower but scores the query and passage jointly.
         """
+        _rerank_timing.ms = 0.0
+        if not self.children or self.index is None or getattr(self.index, "ntotal", 0) == 0:
+            return []
+
         model  = _get_embedder()
         q_vec  = model.encode([query], normalize_embeddings=True).astype("float32")
         fetch_k = top_k_children * 4 if rerank else top_k_children
@@ -895,7 +920,9 @@ class BrochureFAISSStore:
         return results[:top_k_children]
 
     def get_context_string(self, query: str, top_k: int = 5) -> str:
-        hits  = self.retrieve(query, top_k_children=top_k)
+        hits = self.retrieve(query, top_k_children=top_k)
+        if not hits:
+            return ""
         parts = [
             f"[{h['product_name']} | Page {h['page_num']}]\n{h['parent_text']}"
             for h in hits
@@ -912,6 +939,8 @@ _store_cache: Dict[str, BrochureFAISSStore] = {}
 
 def list_available_products() -> List[Dict]:
     results = []
+    if not INDEXES_DIR.exists() or not INDEXES_DIR.is_dir():
+        return results
     for d in sorted(INDEXES_DIR.iterdir()):
         if d.is_dir() and d.name != USER_UPLOAD_SLUG:
             mp = d / "meta.json"

@@ -43,8 +43,25 @@ class IngestionStage(str, Enum):
 class IngestionLedger:
     def __init__(self, corpus_version: str = "v2_baseline_20260814", ledger_dir: Optional[Path] = None):
         self.corpus_version = corpus_version
-        self.ledger_dir = ledger_dir or Path("./data/corpora") / corpus_version
-        self.ledger_dir.mkdir(parents=True, exist_ok=True)
+        if ledger_dir:
+            self.ledger_dir = Path(ledger_dir)
+        else:
+            candidates = [
+                Path("./data/corpora") / corpus_version,
+                Path(__file__).resolve().parent.parent.parent / "data" / "corpora" / corpus_version,
+                Path(__file__).resolve().parent.parent.parent.parent / "data" / "corpora" / corpus_version,
+            ]
+            self.ledger_dir = candidates[0]
+            for cand in candidates:
+                if cand.exists():
+                    self.ledger_dir = cand
+                    break
+
+        try:
+            self.ledger_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning("Could not create ledger dir %s: %s", self.ledger_dir, exc)
+
         self.ledger_file = self.ledger_dir / "ledger.json"
         self._entries: dict[str, dict[str, Any]] = {}
         self._load()

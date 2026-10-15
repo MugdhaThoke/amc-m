@@ -655,6 +655,9 @@ test-reports/
 test-output/
 *-test-results.json
 *-test-report.html
+e2e_screenshots/
+e2e_verification.png
+
 
 # Temporary test files
 test-temp/

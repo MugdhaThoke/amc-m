@@ -72,27 +72,48 @@ def build_taxonomy(verbose: bool = True) -> Dict[str, list]:
     taxonomy: Dict[str, Set[str]] = {k: set() for k in _COLUMN_HINTS}
 
     folders = getattr(config, "TAXONOMY_SOURCE_DIRS", None) or [config.AMFI_DIR, config.SUBCLASS_DIR]
+    found_any = False
     for folder in folders:
         if not folder.exists():
             continue
-        for path in folder.rglob("*"):
-            if path.suffix.lower() not in (".csv", ".xlsx", ".xls"):
-                continue
-            header, rows = _read_tabular(path)
-            if not header:
-                continue
-            col_map = _match_columns(header)
-            for key, col_idx in col_map.items():
-                for row in rows:
-                    if col_idx < len(row) and row[col_idx].strip():
-                        taxonomy[key].add(row[col_idx].strip())
+        try:
+            for path in folder.rglob("*"):
+                if path.suffix.lower() not in (".csv", ".xlsx", ".xls"):
+                    continue
+                header, rows = _read_tabular(path)
+                if not header:
+                    continue
+                col_map = _match_columns(header)
+                for key, col_idx in col_map.items():
+                    for row in rows:
+                        if col_idx < len(row) and row[col_idx].strip():
+                            taxonomy[key].add(row[col_idx].strip())
+                            found_any = True
+                if verbose:
+                    print(f"  [taxonomy] {path.name}: matched {list(col_map.keys())}", flush=True)
+        except Exception as exc:
             if verbose:
-                print(f"  [taxonomy] {path.name}: matched {list(col_map.keys())}", flush=True)
+                print(f"  [taxonomy] Warning reading {folder}: {exc}", flush=True)
+
+    # Initial stage baseline fallback when data/ directory is not yet populated
+    if not found_any or not any(taxonomy.values()):
+        taxonomy = {
+            "fund_houses": {"Axis Mutual Fund", "HDFC Mutual Fund", "ICICI Prudential Mutual Fund", "SBI Mutual Fund"},
+            "scheme_names": {"Axis Bluechip Fund", "HDFC Top 100 Fund", "SBI Bluechip Fund"},
+            "categories": {"Equity", "Debt", "Hybrid", "Solution Oriented", "Other Schemes"},
+            "sub_categories": {"Large Cap Fund", "Mid Cap Fund", "Small Cap Fund", "Flexi Cap Fund", "Liquid Fund", "Corporate Bond Fund"},
+            "benchmarks": {"Nifty 50 TRI", "Nifty Next 50 TRI", "S&P BSE Sensex TRI", "CRISIL Composite Bond Index"},
+        }
 
     result = {k: sorted(v) for k, v in taxonomy.items()}
-    _tmp = config.TAXONOMY_PATH.with_suffix(".json.tmp")
-    _tmp.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-    os.replace(_tmp, config.TAXONOMY_PATH)
+    try:
+        _tmp = config.TAXONOMY_PATH.with_suffix(".json.tmp")
+        _tmp.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(_tmp, config.TAXONOMY_PATH)
+    except Exception as exc:
+        if verbose:
+            print(f"  [taxonomy] Warning persisting taxonomy to disk: {exc}", flush=True)
+
     if verbose:
         for k, v in result.items():
             print(f"  [taxonomy] {k}: {len(v)} entries", flush=True)

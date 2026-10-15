@@ -6,6 +6,7 @@
 # ===========================================================================
 
 """NER + Entity Extractor (LLM-based AMC-domain NER)."""
+import asyncio
 import logging
 
 from pydantic import BaseModel, Field
@@ -67,11 +68,26 @@ class EntityExtractor:
         mentions: list[ExtractedMention] = []
         seen: set[tuple[str, str]] = set()
 
-        # Extract per-section to keep prompts small and context tight.
+        # Group sections into text windows (800 - 4000 chars) to avoid hundreds of separate LLM calls
+        windows: list[str] = []
+        current_buf: list[str] = []
+        current_len = 0
         for section in document.sections:
-            if not section.text.strip():
+            t = section.text.strip()
+            if not t or len(t) < 30:
                 continue
-            rendered = prompt.render(content=section.text[:6000])
+            if current_len + len(t) > 4000 and current_buf:
+                windows.append("\n\n".join(current_buf))
+                current_buf = [t]
+                current_len = len(t)
+            else:
+                current_buf.append(t)
+                current_len += len(t)
+        if current_buf:
+            windows.append("\n\n".join(current_buf))
+
+        for window_text in windows:
+            rendered = prompt.render(content=window_text[:6000])
             try:
                 result = await self._llm.complete_structured(
                     rendered, _EXTRACTION_SCHEMA, system=prompt.system, fast=True,
@@ -80,21 +96,65 @@ class EntityExtractor:
                 logger.warning("Entity extraction failed on section of %s: %s",
                                document.filename, exc)
                 continue
-            for raw in result.get("entities", []):
-                key = (raw["type"], raw["normalized_name"].lower())
+
+            entities_list = (
+                result.get("entities", [])
+                if isinstance(result, dict)
+                else (result if isinstance(result, list) else [])
+            )
+            for raw in entities_list:
+                if isinstance(raw, str):
+                    raw_name = raw.strip()
+                    if not raw_name:
+                        continue
+                    key = ("Entity", raw_name.lower())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    mentions.append(ExtractedMention(
+                        type="Entity",
+                        surface_form=raw_name,
+                        normalized_name=raw_name,
+                        properties={},
+                        context=window_text[:300],
+                        confidence=0.85,
+                    ))
+                    continue
+
+                if not isinstance(raw, dict):
+                    continue
+
+                raw_type = str(raw.get("type") or "Entity")
+                raw_surface = str(raw.get("surface_form") or raw.get("name") or "")
+                raw_norm = str(raw.get("normalized_name") or raw_surface or "")
+                if not raw_norm:
+                    continue
+
+                key = (raw_type, raw_norm.lower())
                 if key in seen:
                     continue
                 seen.add(key)
-                
-                confidence = float(raw.get("confidence", 0.85))
-                confidence = max(0.0, min(1.0, confidence))  # clamp to [0,1]
-                
+
+                try:
+                    conf = float(raw.get("confidence", 0.85))
+                except (ValueError, TypeError):
+                    conf = 0.85
+                conf = max(0.0, min(1.0, conf))
+
+                props = raw.get("properties", {})
+                if not isinstance(props, dict):
+                    props = {}
+
                 mentions.append(ExtractedMention(
-                    type=raw["type"],
-                    surface_form=raw["surface_form"],
-                    normalized_name=raw["normalized_name"],
-                    properties=raw.get("properties", {}),
-                    context=section.text[:300],
-                    confidence=confidence,
+                    type=raw_type,
+                    surface_form=raw_surface or raw_norm,
+                    normalized_name=raw_norm,
+                    properties=props,
+                    context=window_text[:300],
+                    confidence=conf,
                 ))
+
+            # Small pause to avoid Groq rate limit spikes during batch ingest
+            await asyncio.sleep(0.2)
+
         return mentions

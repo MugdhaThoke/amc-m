@@ -15,12 +15,27 @@ except ImportError:
 from app.ingestion.parsers.base import BaseParser
 from app.models.documents import Document, DocumentType, Section
 
-# Lines that look like section headings in scheme documents / circulars,
-# e.g. "--- Section 4.2: Portfolio Holdings ---", "SECTION 9: EXIT LOAD", "4.2 Portfolio Holdings"
-_HEADING_RE = re.compile(
-    r"^\s*(-{2,}\s*)?(section\s+[\d.]+|[A-Z][A-Z \d.:&\-]{6,})\s*(-{2,})?\s*$",
-    re.IGNORECASE,
-)
+def _is_heading(line: str) -> bool:
+    s = line.strip().strip("-").strip()
+    if not s or len(s) > 90 or len(s) < 3:
+        return False
+    # Explicit Section/Part/Clause/Chapter headings: e.g. "Section 4", "SECTION 1.2: OBJECTIVE"
+    if re.match(r"^(section|part|clause|chapter)\s+[\d.A-Za-z]+", s, re.IGNORECASE):
+        return True
+    # Numbered headings: e.g. "1.2 Investment Policy", "3.1.4 Risk Factors"
+    if re.match(r"^\d+(\.\d+)+\s+[A-Z]", s):
+        return True
+    # Markdown-style headings: "# Introduction", "## Holdings"
+    if line.strip().startswith("#"):
+        return True
+    # Explicit banner headings: "--- Portfolio Holdings ---"
+    if re.match(r"^-{2,}.*-{2,}$", line.strip()):
+        return True
+    # All-uppercase headings with at least 2 words and all uppercase letters: e.g. "PORTFOLIO HOLDINGS", "EXIT LOAD DETAILS"
+    words = [w for w in s.split() if any(c.isalpha() for c in w)]
+    if len(words) >= 2 and all(w.isupper() for w in words):
+        return True
+    return False
 
 
 class PdfParser(BaseParser):
@@ -56,7 +71,7 @@ class PdfParser(BaseParser):
                 pass
 
             for line in page.get_text("text").splitlines():
-                if _HEADING_RE.match(line) and len(line.strip()) < 90:
+                if _is_heading(line):
                     flush()
                     current_title = line.strip().strip("-").strip()
                     current_lines = []

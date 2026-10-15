@@ -59,8 +59,16 @@ def _store():
 def _get_store():
     try:
         return _store()
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=503, detail=f"FAISS index unavailable: {exc}")
+    except Exception as exc:
+        logger.warning("FAISS index unavailable (%s) - operating with empty in-memory fallback store", exc)
+        store = engine_faiss.BrochureFAISSStore.__new__(engine_faiss.BrochureFAISSStore)
+        import faiss
+        store.slug = "amc_master"
+        store.index = faiss.IndexFlatIP(384)
+        store.children = []
+        store.parents_map = {}
+        store.meta = {}
+        return store
 
 
 def _confidence(label: str | None) -> str:

@@ -251,7 +251,9 @@ class TaskScheduler:
         self._add_job(self._process_governance_batch, "governance_batch", "Governance Feedback Batch", CronSpec(day_of_week="fri", hour=9, minute=0))
         self._add_job(self._maintain_caches, "cache_maintenance", "Semantic Cache Maintenance", CronSpec(hour=2, minute=0))
         self._add_job(self._aggregate_metrics, "metrics_aggregation", "Hourly Performance Metrics Aggregation", CronSpec(minute=0))
-        logger.info("Registered 5 background tasks in scheduler")
+        self._add_job(self._reconcile_feedback_drift, "feedback_drift_reconciliation", "Feedback Category Drift Reconciliation", CronSpec(hour=2, minute=30))
+        logger.info("Registered 6 background tasks in scheduler")
+
 
     # ── Execution plumbing ────────────────────────────────────────────────
 
@@ -427,7 +429,29 @@ class TaskScheduler:
             logger.warning("Metrics aggregation failed: %s", exc)
             return {"status": "failed", "error": str(exc)}
 
+    async def _reconcile_feedback_drift(self) -> Dict[str, Any]:
+        """Recompute feedback category counts from raw feedback entries to catch drift."""
+        logger.info("[Job] Running feedback category drift reconciliation...")
+        try:
+            from app.core.database import SessionLocal
+            from app.feedback import issue_store
+
+            def _run():
+                db = SessionLocal()
+                try:
+                    return issue_store.reconcile_issue_category_counts(db)
+                finally:
+                    db.close()
+
+            report = await asyncio.to_thread(_run)
+            logger.info("Feedback drift reconciliation finished: %s", report)
+            return report
+        except Exception as exc:
+            logger.warning("Feedback drift reconciliation failed: %s", exc)
+            return {"status": "failed", "error": str(exc)}
+
     # ── Lifecycle ─────────────────────────────────────────────────────────
+
 
     def start(self):
         """Start the background scheduler."""
