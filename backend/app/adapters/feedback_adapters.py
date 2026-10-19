@@ -176,6 +176,21 @@ class AMCDatabaseAdapter(AbstractDatabaseAdapter):
                     logger.warning("Failed to extract correction claim: %s", ex)
                     corrections = {"feedback_text": row.feedback_text}
 
+            # If corrections not yet set, but active user provided categories or text
+            if corrections is None and (row.selected_categories or row.feedback_text):
+                corrections = {
+                    "feedback_text": row.feedback_text,
+                    "categories": row.selected_categories or [],
+                }
+
+            if not entity_name and row.query_text:
+                try:
+                    from app.feedback.correction_extractor import CorrectionExtractor
+                    extractor = CorrectionExtractor()
+                    entity_name = extractor._extract_entity(row.query_text)
+                except Exception:
+                    pass
+
             return dm.FeedbackRecord(
                 feedback_id=row.feedback_id,
                 response_id=row.response_id,

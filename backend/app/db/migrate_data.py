@@ -579,8 +579,19 @@ def populate_response_feedback(db: Session) -> int:
         ).first()
         if not existing:
             if not db.query(ChatSession).filter_by(session_id=fb["session_id"]).first():
-                db.add(ChatSession(session_id=fb["session_id"], audit_id=default_audit_id))
-                db.commit()
+                try:
+                    db.add(ChatSession(
+                        session_id=fb["session_id"],
+                        user_id=fb.get("actor_id") or "system_migration",
+                        tenant_id=None,
+                        created_at=_now(),
+                        updated_at=_now(),
+                        audit_id=default_audit_id,
+                    ))
+                    db.commit()
+                except Exception as sess_err:
+                    logger.warning("Could not add parent ChatSession for feedback: %s", sess_err)
+                    db.rollback()
             try:
                 db.add(ResponseFeedback(**fb))
                 db.commit()

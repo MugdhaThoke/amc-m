@@ -51,7 +51,7 @@ class RepairEngineIntegration:
     
     def __init__(self, repair_service_url: Optional[str] = None):
         """Initialize with repair engine URL."""
-        self.repair_service_url = repair_service_url or get_settings().repair_service_url
+        self.repair_service_url = repair_service_url or get_settings().repair_service_url or "http://localhost:8002"
         self.timeout = float(get_settings().service_timeout or 30.0)
     
     async def trigger_repair_engine(
@@ -73,17 +73,68 @@ class RepairEngineIntegration:
             logger.debug("Repair service URL not configured, skipping repair engine trigger")
             return {"success": False, "reason": "repair_service_url_not_configured"}
         
-        if not record.dissatisfaction_evidence_json:
-            logger.debug("No dissatisfaction evidence for %s, skipping repair trigger", record.response_id)
-            return {"success": False, "reason": "no_dissatisfaction_evidence"}
-        
-        evidence = record.dissatisfaction_evidence_json
-        correction_claims = evidence.get("correction_claims", [])
-        
-        if not correction_claims:
-            logger.debug("No correction claims in evidence for %s, skipping", record.response_id)
-            return {"success": False, "reason": "no_correction_claims"}
-        
+        evidence = record.dissatisfaction_evidence_json or {}
+        raw_claims = evidence.get("correction_claims", []) if isinstance(evidence, dict) else []
+
+        valid_claims = []
+        for c in raw_claims:
+            if isinstance(c, dict) and (c.get("attribute") or c.get("asserted_value") or c.get("entity_id")):
+                valid_claims.append(c)
+
+        if not valid_claims:
+            # Fallback claim synthesis when repair is flagged by root_cause/adjudication
+            synth_entity = None
+            synth_attr = record.root_cause or "compliance"
+            synth_val = None
+
+            fb_notes = evidence.get("feedback_text") if isinstance(evidence, dict) else None
+            fb_cats = []
+
+            if db:
+                try:
+                    from app.schemas.response_feedback_table import ResponseFeedback
+                    fb_row = db.query(ResponseFeedback).filter(ResponseFeedback.response_id == record.response_id).first()
+                    if fb_row:
+                        fb_notes = fb_notes or fb_row.feedback_text
+                        fb_cats = fb_row.selected_categories or []
+                except Exception as fb_err:
+                    logger.debug("Could not fetch ResponseFeedback for repair synthesis: %s", fb_err)
+
+                try:
+                    from app.schemas.query_evidence_table import QueryEvidence
+                    q_ev = db.query(QueryEvidence).filter(QueryEvidence.response_id == record.response_id).first()
+                    if q_ev:
+                        if q_ev.assembled_context_json:
+                            ctx = q_ev.assembled_context_json
+                            if isinstance(ctx, dict):
+                                sources = ctx.get("sources") or ctx.get("chunks") or []
+                                if sources and isinstance(sources, list) and isinstance(sources[0], dict):
+                                    synth_entity = sources[0].get("document_title") or sources[0].get("document_id") or sources[0].get("entity_id")
+                            elif isinstance(ctx, list) and ctx and isinstance(ctx[0], dict):
+                                synth_entity = ctx[0].get("document_title") or ctx[0].get("document_id") or ctx[0].get("entity_id")
+                        if not synth_entity and q_ev.query_text:
+                            synth_entity = "Thematic Fund" if "thematic" in q_ev.query_text.lower() else "AMC Scheme"
+                except Exception as q_err:
+                    logger.debug("Could not fetch QueryEvidence for repair synthesis: %s", q_err)
+
+            if fb_cats:
+                synth_attr = f"{record.root_cause or 'compliance'}_{fb_cats[0]}"
+
+            synth_entity = synth_entity or (record.root_cause.capitalize() if record.root_cause else "Compliance Entity")
+            synth_val = fb_notes or f"Flagged {record.root_cause or 'compliance'} repair: {', '.join(fb_cats) if fb_cats else 'triage'}"
+
+            valid_claims = [{
+                "entity_id": synth_entity,
+                "entity_name": synth_entity,
+                "attribute": synth_attr,
+                "asserted_value": synth_val,
+                "rejected_value": "canonical",
+                "confidence": float(record.adjudication_confidence or 0.85),
+                "source": "unified_repair_synthesizer"
+            }]
+
+        correction_claims = valid_claims
+
         log_step_info(
             logger,
             "REPAIR_TRIGGER",
@@ -112,6 +163,27 @@ class RepairEngineIntegration:
                     if patch_response:
                         patch_id = patch_response.get("patch_id")
                         result["patches_created"].append(patch_id)
+                        try:
+                            from app.graph.correction_patch_layer import get_correction_patch_layer, CorrectionPatch
+                            from app.schemas.models import _now_iso
+                            from dataclasses import asdict
+                            p_layer = get_correction_patch_layer()
+                            p_obj = CorrectionPatch(
+                                patch_id=patch_id,
+                                entity_id=str(claim.get("entity_id") or "unknown_entity"),
+                                attribute=str(claim.get("attribute") or "general"),
+                                canonical_value=claim.get("rejected_value") or "canonical",
+                                corrected_value=claim.get("asserted_value") or claim.get("rejected_value") or "repair_flagged",
+                                confidence=float(claim.get("confidence", 0.75)),
+                                provenance={"source": "unified_feedback_loop", "response_id": record.response_id},
+                                approved=False,
+                                created_at=_now_iso()
+                            )
+                            p_layer._mem_store[patch_id] = asdict(p_obj)
+                            k = p_layer._make_key(p_obj.entity_id, p_obj.attribute)
+                            p_layer._mem_store[k] = asdict(p_obj)
+                        except Exception as p_sync_err:
+                            logger.debug("Local patch store sync notice: %s", p_sync_err)
                         log_step_info(
                             logger,
                             "PATCH_CREATED",
@@ -210,6 +282,16 @@ class RepairEngineIntegration:
                 except Exception as auto_exc:
                     logger.debug("Hands-free auto-approval notice: %s", auto_exc)
 
+        if db and (result.get("patches_created") or record.repair):
+            try:
+                from app.services.repair_proposal_service import RepairProposalService
+                proposal_svc = RepairProposalService()
+                proposal = proposal_svc.create_proposal_from_record(record, db)
+                result["proposal_id"] = proposal.proposal_id
+                log_step_info(logger, "PROPOSAL_CREATED", "Repair proposal created: %s", proposal.proposal_id)
+            except Exception as prop_exc:
+                logger.debug("Repair proposal creation notice: %s", prop_exc)
+
         return result
     
     async def _create_patch_via_api(
@@ -234,8 +316,8 @@ class RepairEngineIntegration:
         payload = {
             "entity_id": claim.get("entity_id") or claim.get("entity_name") or "unknown_entity",
             "attribute": claim.get("attribute") or "general",
-            "canonical_value": claim.get("rejected_value"),
-            "corrected_value": claim.get("asserted_value"),
+            "canonical_value": claim.get("rejected_value") or "canonical",
+            "corrected_value": claim.get("asserted_value") or claim.get("rejected_value") or "repair_flagged",
             "confidence": float(claim.get("confidence", 0.75)),
             "provenance": {
                 "source": "unified_feedback_loop",

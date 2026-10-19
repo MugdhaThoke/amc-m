@@ -110,6 +110,13 @@ class RepairProposalService:
                     if isinstance(chunk, dict) and chunk.get("entity_id"):
                         entity_id = chunk["entity_id"]
                         break
+            elif isinstance(assembled, dict):
+                sources = assembled.get("sources") or assembled.get("chunks") or []
+                if isinstance(sources, list):
+                    for chunk in sources:
+                        if isinstance(chunk, dict) and (chunk.get("entity_id") or chunk.get("document_id")):
+                            entity_id = chunk.get("entity_id") or chunk.get("document_id")
+                            break
 
         # Check dissatisfaction evidence if available
         if record.dissatisfaction_evidence_json:
@@ -175,7 +182,8 @@ RETURN e
                         if doc_id:
                             document_ids.append(str(doc_id))
             elif isinstance(assembled, dict):
-                for chunk in assembled.get("chunks", []):
+                sources = assembled.get("sources") or assembled.get("chunks") or []
+                for chunk in sources:
                     if isinstance(chunk, dict):
                         doc_id = chunk.get("document_id") or chunk.get("doc_id") or chunk.get("chunk_id")
                         if doc_id:

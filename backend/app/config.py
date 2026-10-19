@@ -17,7 +17,11 @@ logger = logging.getLogger("config")
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=(".env", "backend/.env"),
+        env_file_encoding="utf-8",
+        extra="ignore"
+    )
 
     # --- App ---
     app_name: str = "NuSummit ContextGraph API"
@@ -93,11 +97,11 @@ class Settings(BaseSettings):
         description="Enable microservices mode (separate service communication)"
     )
     feedback_service_url: Optional[str] = Field(
-        default=None,
+        default="http://localhost:8001",
         description="Feedback Loop Service URL (e.g., http://feedback:8001)"
     )
     repair_service_url: Optional[str] = Field(
-        default=None,
+        default="http://localhost:8002",
         description="Repair Engine Service URL (e.g., http://repair:8002)"
     )
     service_timeout: float = Field(

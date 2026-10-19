@@ -310,7 +310,7 @@ async def _run_v2_orchestrator(
             url=getattr(src, "url", get_pdf_url(src.document_title or src.document_id, getattr(src, "page", 1))),
         )
         for src in context.sources
-    ] if context and context.sources else [
+    ] if (context and context.sources) else [
         SourceAttribution(
             source_index=i + 1,
             document_id=c.document_id,
@@ -323,8 +323,25 @@ async def _run_v2_orchestrator(
             verbatim_text=c.text,
             url=get_pdf_url(c.document_title or c.document_id, getattr(c, "page", 1)),
         )
-        for i, c in enumerate(retrieval_res.chunks[:5])
+        for i, c in enumerate((retrieval_res.chunks if retrieval_res else [])[:5])
     ]
+
+    if not sources and synthesis and getattr(synthesis, "provenance", None):
+        sources = [
+            SourceAttribution(
+                source_index=p.get("source_index", i + 1),
+                document_id=p.get("chunk_id", f"src_{i+1}"),
+                document_title=p.get("doc", "Repair Engine Registry"),
+                chunk_id=p.get("chunk_id", f"src_{i+1}"),
+                snippet=p.get("snippet", ""),
+                page=1,
+                page_number=1,
+                page_label="p. 1",
+                verbatim_text=p.get("snippet", ""),
+                url=get_pdf_url(p.get("doc", "Repair Engine Registry"), 1),
+            )
+            for i, p in enumerate(synthesis.provenance)
+        ]
 
     graph_facts = retrieval_res.graph_facts if retrieval_res else []
     graph_nodes = sorted({f.subject for f in graph_facts} | {f.object for f in graph_facts})
@@ -599,8 +616,8 @@ async def _run_v2_orchestrator(
         intent=intent,
         answer=synthesis if mode in ("contextgraph", "both") else None,
         sources=sources if mode in ("contextgraph", "both") else [],
-        traversal_paths=retrieval_res.traversal_paths,
-        taxonomy_paths=intent.taxonomy_paths,
+        traversal_paths=retrieval_res.traversal_paths if retrieval_res else [],
+        taxonomy_paths=intent.taxonomy_paths if intent else [],
         # Full legacy-compatible graph_highlight dict — all fields the frontend
         # _to_hybrid() adapter reads must be present here.
         graph_highlight={
