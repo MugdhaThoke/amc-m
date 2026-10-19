@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { hasUserMessage, formatSidebarSessions } from "../utils/chatSessionUtils.js";
+import {
+  hasUserMessage,
+  formatSidebarSessions,
+  getUserChatSessionsKey,
+  getUserActiveSessionIdKey,
+  loadUserChatSessions,
+} from "../utils/chatSessionUtils.js";
 
 test("hasUserMessage validation", () => {
   assert.equal(hasUserMessage(null), false);
@@ -262,4 +268,300 @@ test("Edge case: switching between existing chats preserves history and order", 
   assert.equal(sidebar[0].session_id, "chat-2");
   assert.equal(sidebar[1].session_id, "chat-1");
 });
+
+test("Login behavior: user login always starts with a fresh new chat session and NOT existing last recent chat", () => {
+  // Simulate backend having 3 previous chats for the logging-in user
+  const backendSessions = [
+    { session_id: "prev-recent-chat", preview: "Most recent query", title: "Most recent query", modified_time: 3000 },
+    { session_id: "prev-older-chat-1", preview: "Older query 1", title: "Older query 1", modified_time: 2000 },
+    { session_id: "prev-older-chat-2", preview: "Older query 2", title: "Older query 2", modified_time: 1000 },
+  ];
+  const validIds = new Set(backendSessions.map((b) => b.session_id));
+
+  // 1. User signs in -> login commit logic assigns a fresh UUID and resets local chat state
+  const freshLoginSessionId = "fresh-new-session-uuid";
+  let chatSessionId = freshLoginSessionId;
+  let chatSessions = {};
+  let isLoginPendingNewChat = true;
+
+  // 2. syncBackendSessions runs: populates chatSessions from backend
+  for (const bs of backendSessions) {
+    chatSessions[bs.session_id] = {
+      id: bs.session_id,
+      title: bs.title,
+      history: [{ role: "user", content: bs.preview }],
+      updatedAt: bs.modified_time * 1000,
+    };
+  }
+
+  // Active session resolution logic in syncBackendSessions
+  function resolveActiveSession(currId) {
+    if (isLoginPendingNewChat) {
+      isLoginPendingNewChat = false;
+      const freshId =
+        currId && !validIds.has(currId) && (!chatSessions[currId] || !hasUserMessage(chatSessions[currId]))
+          ? currId
+          : "new-fallback-uuid";
+      return freshId;
+    }
+    if (currId && validIds.has(currId)) {
+      return currId;
+    }
+    if (currId && (!chatSessions[currId] || !hasUserMessage(chatSessions[currId]))) {
+      return currId;
+    }
+    return "new-fallback-uuid";
+  }
+
+  const resolvedActiveId = resolveActiveSession(chatSessionId);
+
+  // Assert: Active chat MUST be the fresh new session, NEVER the most recent chat!
+  assert.equal(resolvedActiveId, freshLoginSessionId);
+  assert.notEqual(resolvedActiveId, "prev-recent-chat");
+  assert.equal(chatSessions[resolvedActiveId], undefined); // Still clean blank session
+
+  // Assert: Recent chats in sidebar lists all 3 existing chats
+  const sidebar = formatSidebarSessions(chatSessions);
+  assert.equal(sidebar.length, 3);
+  assert.equal(sidebar[0].session_id, "prev-recent-chat");
+  assert.equal(sidebar[1].session_id, "prev-older-chat-1");
+  assert.equal(sidebar[2].session_id, "prev-older-chat-2");
+
+  // Assert: None of the existing chats are marked as current/active
+  assert.equal(sidebar.some((s) => s.session_id === resolvedActiveId), false);
+});
+
+test("Syncing backend sessions preserves a blank new chat even when previous chats exist in backend", () => {
+  const backendSessions = [
+    { session_id: "prev-1", title: "Existing chat", modified_time: 1000 },
+  ];
+  const validIds = new Set(backendSessions.map((b) => b.session_id));
+  const chatSessions = {
+    "prev-1": { id: "prev-1", title: "Existing chat", history: [{ role: "user", content: "Hi" }] },
+  };
+
+  const currentBlankId = "blank-active-uuid";
+
+  function resolveActiveSession(currId) {
+    if (currId && validIds.has(currId)) {
+      return currId;
+    }
+    if (currId && (!chatSessions[currId] || !hasUserMessage(chatSessions[currId]))) {
+      return currId;
+    }
+    return "fallback-uuid";
+  }
+
+  const result = resolveActiveSession(currentBlankId);
+  // Must preserve blank session, not switch to prev-1
+  assert.equal(result, "blank-active-uuid");
+});
+
+function createMockStorage(initial = {}) {
+  const store = { ...initial };
+  return {
+    getItem(k) {
+      return store[k] !== undefined ? store[k] : null;
+    },
+    setItem(k, v) {
+      store[k] = String(v);
+    },
+    removeItem(k) {
+      delete store[k];
+    },
+    clear() {
+      for (const k of Object.keys(store)) delete store[k];
+    },
+    _raw() {
+      return store;
+    },
+  };
+}
+
+test("Storage key helpers partition keys by authenticated username", () => {
+  assert.equal(getUserChatSessionsKey("sarah.compliance"), "ns_cg_chat_sessions_v1_sarah.compliance");
+  assert.equal(getUserActiveSessionIdKey("sarah.compliance"), "ns_cg_active_session_id_v1_sarah.compliance");
+
+  assert.equal(getUserChatSessionsKey("vikram.pm"), "ns_cg_chat_sessions_v1_vikram.pm");
+  assert.equal(getUserActiveSessionIdKey("vikram.pm"), "ns_cg_active_session_id_v1_vikram.pm");
+
+  assert.equal(getUserChatSessionsKey(null), "ns_cg_chat_sessions_v1");
+  assert.equal(getUserActiveSessionIdKey(null), "ns_cg_active_session_id_v1");
+  assert.equal(getUserChatSessionsKey(""), "ns_cg_chat_sessions_v1");
+  assert.equal(getUserActiveSessionIdKey(""), "ns_cg_active_session_id_v1");
+});
+
+test("loadUserChatSessions automatically migrates legacy unpartitioned storage key", () => {
+  const legacySessions = {
+    "legacy-chat-1": {
+      id: "legacy-chat-1",
+      title: "Legacy Chat",
+      history: [{ role: "user", content: "What is the NAV?" }],
+      updatedAt: 1000,
+    },
+    "legacy-empty": {
+      id: "legacy-empty",
+      title: "New Conversation",
+      history: [],
+      updatedAt: 500,
+    },
+  };
+
+  const storage = createMockStorage({
+    ns_cg_chat_sessions_v1: JSON.stringify(legacySessions),
+  });
+
+  const loaded = loadUserChatSessions("sarah.compliance", storage);
+
+  // Cleaned: only contains valid conversations
+  assert.equal(Object.keys(loaded).length, 1);
+  assert.equal(loaded["legacy-chat-1"].title, "Legacy Chat");
+  assert.equal(loaded["legacy-empty"], undefined);
+
+  // Partitioned key was written
+  const userKey = getUserChatSessionsKey("sarah.compliance");
+  assert.notEqual(storage.getItem(userKey), null);
+
+  // Legacy key was cleaned up
+  assert.equal(storage.getItem("ns_cg_chat_sessions_v1"), null);
+});
+
+test("Chat persistence across logout and re-login: user chat history is preserved", () => {
+  const storage = createMockStorage();
+  const username = "sarah.compliance";
+  const userKey = getUserChatSessionsKey(username);
+
+  // 1. User logs in, has conversations
+  const userSessions = {
+    "sarah-chat-1": {
+      id: "sarah-chat-1",
+      title: "SEBI Compliance Review",
+      history: [{ role: "user", content: "Check SEBI circular limits" }],
+      updatedAt: 1000,
+    },
+    "sarah-chat-2": {
+      id: "sarah-chat-2",
+      title: "Portfolio Analysis",
+      history: [{ role: "user", content: "Review HDFC Top 100 allocation" }],
+      updatedAt: 2000,
+    },
+  };
+  storage.setItem(userKey, JSON.stringify(userSessions));
+
+  // 2. User logs out: auth tokens are cleared, but user chat history is NOT purged!
+  const simulatedClearAuth = (mockStore) => {
+    mockStore.removeItem("ns_cg_auth_session_v1");
+    mockStore.removeItem("ns_cg_active_user_v1");
+    // Crucial check: userKey must NOT be removed on logout
+  };
+  simulatedClearAuth(storage);
+
+  // Verify chat history still safely exists on storage
+  assert.notEqual(storage.getItem(userKey), null);
+
+  // 3. User logs in again: history is loaded
+  const restored = loadUserChatSessions(username, storage);
+  assert.equal(Object.keys(restored).length, 2);
+  assert.equal(restored["sarah-chat-1"].title, "SEBI Compliance Review");
+  assert.equal(restored["sarah-chat-2"].title, "Portfolio Analysis");
+
+  // Sidebar shows both previous conversations
+  const sidebar = formatSidebarSessions(restored);
+  assert.equal(sidebar.length, 2);
+  assert.equal(sidebar[0].session_id, "sarah-chat-2");
+  assert.equal(sidebar[1].session_id, "sarah-chat-1");
+
+  // 4. Initial active session on login is a fresh new session, NOT continuing previous chat
+  const newLoginActiveSessionId = "fresh-login-uuid-999";
+  assert.equal(restored[newLoginActiveSessionId], undefined); // Fresh blank canvas
+});
+
+test("Multi-user session isolation: User A and User B cannot access each other's chats", () => {
+  const storage = createMockStorage();
+  const userA = "sarah.compliance";
+  const userB = "vikram.pm";
+
+  // Step 1: User A logs in and has 2 chats
+  const userASessions = {
+    "sarah-1": {
+      id: "sarah-1",
+      title: "Sarah Compliance Chat 1",
+      history: [{ role: "user", content: "SEBI mandate query" }],
+      updatedAt: 1000,
+    },
+    "sarah-2": {
+      id: "sarah-2",
+      title: "Sarah Compliance Chat 2",
+      history: [{ role: "user", content: "Audit report check" }],
+      updatedAt: 2000,
+    },
+  };
+  storage.setItem(getUserChatSessionsKey(userA), JSON.stringify(userASessions));
+
+  // Step 2: User A logs out, User B logs in
+  const userBLoaded = loadUserChatSessions(userB, storage);
+  // User B must NOT see any of User A's chats
+  assert.deepEqual(userBLoaded, {});
+  assert.equal(formatSidebarSessions(userBLoaded).length, 0);
+
+  // Step 3: User B creates a chat
+  const userBSessions = {
+    "vikram-1": {
+      id: "vikram-1",
+      title: "Vikram Portfolio Strategy",
+      history: [{ role: "user", content: "Sector allocation review" }],
+      updatedAt: 3000,
+    },
+  };
+  storage.setItem(getUserChatSessionsKey(userB), JSON.stringify(userBSessions));
+
+  // Step 4: Verify User B's sidebar only shows User B's chat
+  const userBSidebar = formatSidebarSessions(loadUserChatSessions(userB, storage));
+  assert.equal(userBSidebar.length, 1);
+  assert.equal(userBSidebar[0].session_id, "vikram-1");
+  assert.equal(userBSidebar[0].title, "Vikram Portfolio Strategy");
+
+  // Step 5: User B logs out, User A logs back in
+  const userAReloaded = loadUserChatSessions(userA, storage);
+  assert.equal(Object.keys(userAReloaded).length, 2);
+  assert.equal(userAReloaded["sarah-1"].title, "Sarah Compliance Chat 1");
+  assert.equal(userAReloaded["sarah-2"].title, "Sarah Compliance Chat 2");
+  assert.equal(userAReloaded["vikram-1"], undefined); // No leak of User B's chats
+
+  const userASidebar = formatSidebarSessions(userAReloaded);
+  assert.equal(userASidebar.length, 2);
+  assert.equal(userASidebar.some((s) => s.session_id === "vikram-1"), false);
+});
+
+test("User session deletion isolation: deleting User A's chat does not affect User B", () => {
+  const storage = createMockStorage();
+  const userA = "sarah.compliance";
+  const userB = "vikram.pm";
+
+  const userASessions = {
+    "sarah-1": { id: "sarah-1", title: "S1", history: [{ role: "user", content: "Q1" }], updatedAt: 1000 },
+    "sarah-2": { id: "sarah-2", title: "S2", history: [{ role: "user", content: "Q2" }], updatedAt: 2000 },
+  };
+  const userBSessions = {
+    "vikram-1": { id: "vikram-1", title: "V1", history: [{ role: "user", content: "VQ1" }], updatedAt: 1500 },
+  };
+
+  storage.setItem(getUserChatSessionsKey(userA), JSON.stringify(userASessions));
+  storage.setItem(getUserChatSessionsKey(userB), JSON.stringify(userBSessions));
+
+  // User A deletes sarah-1
+  const copyA = loadUserChatSessions(userA, storage);
+  delete copyA["sarah-1"];
+  storage.setItem(getUserChatSessionsKey(userA), JSON.stringify(copyA));
+
+  // Verify User A now has only sarah-2
+  const updatedA = loadUserChatSessions(userA, storage);
+  assert.deepEqual(Object.keys(updatedA), ["sarah-2"]);
+
+  // Verify User B's sessions are completely unchanged
+  const currentB = loadUserChatSessions(userB, storage);
+  assert.deepEqual(Object.keys(currentB), ["vikram-1"]);
+});
+
+
 

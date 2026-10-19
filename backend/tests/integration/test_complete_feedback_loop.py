@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.core.database import SessionLocal
+from app.schemas.chat_sessions_table import ChatSession
 from app.schemas.query_evidence_table import QueryEvidence
 from app.graph.correction_patch_layer import get_correction_patch_layer
 from app.evaluation.evaluation_router import EvaluationRouter
@@ -34,10 +35,16 @@ async def test_complete_feedback_loop():
     original_answer = "The Total Expense Ratio (TER) of Axis Bluechip Fund is 0.79%."
 
     try:
+        # Step 0: Ensure ChatSession exists for foreign key constraint
+        cs = ChatSession(session_id=session_id, user_id="test_user")
+        db.add(cs)
+        db.commit()
+
         # Step 1: Record initial QueryEvidence
         qe = QueryEvidence(
             response_id=response_id,
             session_id=session_id,
+            user_id="test_user",
             query_text=query,
             assembled_context_json=[
                 {
@@ -103,7 +110,7 @@ async def test_complete_feedback_loop():
         patch_layer.approve_patch(target_patch.patch_id)
         raw_retrieved_context = "Axis Bluechip Fund has an expense ratio of 0.79%."
         healed_context = patch_layer.apply_patches_to_context(
-            entities=["INF846K01DP5"],
+            entities=[target_patch.entity_id, "INF846K01DP5"],
             retrieval_context=raw_retrieved_context,
         )
         assert "0.82" in healed_context

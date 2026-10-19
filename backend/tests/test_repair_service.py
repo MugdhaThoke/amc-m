@@ -13,11 +13,13 @@ to the correction patch layer.
 """
 
 import pytest
+from typing import Optional
 from sqlalchemy.orm import Session
 import uuid
 
 from app.core.database import SessionLocal
 from app.graph.correction_patch_layer import get_correction_patch_layer
+from app.schemas.chat_sessions_table import ChatSession
 from app.schemas.unified_evaluation_records_table import UnifiedEvaluationRecord
 from app.schemas.query_evidence_table import QueryEvidence
 from app.schemas.models import EntryRoute, RootCause, Severity, LifecycleStatus, RepairTarget, AdjudicationVerdict
@@ -52,11 +54,19 @@ def clean_patch_layer():
     layer.clear_all()
 
 
-def create_test_evidence(db: Session, response_id: str) -> None:
+def create_test_evidence(db: Session, response_id: str, session_id: Optional[str] = None) -> str:
     """Helper to create a QueryEvidence record for a test response."""
+    if not session_id:
+        session_id = f"sess_{uuid.uuid4().hex[:8]}"
+    existing_sess = db.query(ChatSession).filter_by(session_id=session_id).first()
+    if not existing_sess:
+        chat_sess = ChatSession(session_id=session_id, user_id="test_user")
+        db.add(chat_sess)
+        db.flush()
     evidence = QueryEvidence(
         response_id=response_id,
-        session_id=f"sess_{uuid.uuid4().hex[:8]}",
+        session_id=session_id,
+        user_id="test_user",
         query_text="Test query",
         retrieval_mode="contextgraph",
         assembled_context_json={"context": "Test context"},
@@ -64,6 +74,7 @@ def create_test_evidence(db: Session, response_id: str) -> None:
     )
     db.add(evidence)
     db.commit()
+    return session_id
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -224,13 +235,14 @@ class TestProcessUnifiedRecordForRepair:
     def test_process_record_with_repair_flag(self, db: Session, clean_patch_layer):
         """Process a unified record marked for repair."""
         response_id = f"resp_{uuid.uuid4().hex[:8]}"
+        session_id = f"sess_{uuid.uuid4().hex[:8]}"
         
         # Create QueryEvidence first (required by FK constraint)
-        create_test_evidence(db, response_id)
+        create_test_evidence(db, response_id, session_id)
         
         # Create a unified record
         record = UnifiedEvaluationRecord(
-            session_id=f"sess_{uuid.uuid4().hex[:8]}",
+            session_id=session_id,
             response_id=response_id,
             entry_route=EntryRoute.HITL,
             evidence_snapshot_ref=response_id,
@@ -272,7 +284,7 @@ class TestProcessUnifiedRecordForRepair:
         session_id = f"sess_{uuid.uuid4().hex[:8]}"
         
         # Create QueryEvidence first
-        create_test_evidence(db, response_id)
+        create_test_evidence(db, response_id, session_id)
         
         # Create a unified record without repair flag
         record = UnifiedEvaluationRecord(
@@ -316,7 +328,7 @@ class TestProcessUnifiedRecordForRepair:
         session_id = f"sess_{uuid.uuid4().hex[:8]}"
         
         # Create QueryEvidence first
-        create_test_evidence(db, response_id)
+        create_test_evidence(db, response_id, session_id)
         
         record = UnifiedEvaluationRecord(
             session_id=session_id,

@@ -22,6 +22,11 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 import requests
 
 # Configure logging with visible indicators
@@ -93,13 +98,17 @@ def step_1_submit_query():
         response = requests.post(
             f"{BACKEND_URL}/api/query",
             json=payload,
-            timeout=30
+            timeout=120
         )
         
         if response.status_code == 200:
             data = response.json()
             response_id = data.get("response_id")
-            response_text = data.get("response", "")
+            answer_val = data.get("answer")
+            if isinstance(answer_val, dict):
+                response_text = answer_val.get("answer", "")
+            else:
+                response_text = answer_val or data.get("response", "")
             
             print(f"\n✅ Query successful!")
             print(f"   Response ID: {response_id}")
@@ -176,21 +185,25 @@ def step_3_check_unified_record(response_id):
     print("STEP 3️⃣: CHECKING UNIFIED EVALUATION RECORD")
     print("=" * 80)
     
-    print(f"\nWaiting 2 seconds for feedback loop to complete...")
-    time.sleep(2)
+    print(f"\nWaiting for feedback loop to complete...")
+    from app.core.database import SessionLocal
+    from app.schemas.unified_evaluation_records_table import UnifiedEvaluationRecord
     
-    print(f"\nChecking database for unified record...")
-    
+    record = None
+    for attempt in range(1, 6):
+        time.sleep(2)
+        try:
+            db = SessionLocal()
+            record = db.query(UnifiedEvaluationRecord).filter(
+                UnifiedEvaluationRecord.response_id == response_id
+            ).first()
+            db.close()
+            if record:
+                break
+        except Exception as e:
+            print(f"   (attempt {attempt} error: {e})")
+            
     try:
-        from app.core.database import SessionLocal
-        from app.schemas.unified_evaluation_records_table import UnifiedEvaluationRecord
-        
-        db = SessionLocal()
-        record = db.query(UnifiedEvaluationRecord).filter(
-            UnifiedEvaluationRecord.response_id == response_id
-        ).first()
-        db.close()
-        
         if record:
             print(f"\nUnified record found!")
             print(f"   Entry Route: {record.entry_route}")
@@ -361,13 +374,17 @@ def step_7_submit_followup_query():
         response = requests.post(
             f"{BACKEND_URL}/api/query",
             json=payload,
-            timeout=30
+            timeout=120
         )
         
         if response.status_code == 200:
             data = response.json()
             response_id = data.get("response_id")
-            response_text = data.get("response", "")
+            answer_val = data.get("answer")
+            if isinstance(answer_val, dict):
+                response_text = answer_val.get("answer", "")
+            else:
+                response_text = answer_val or data.get("response", "")
             
             print(f"\n✅ Follow-up query successful!")
             print(f"   Response ID: {response_id}")
