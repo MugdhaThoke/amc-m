@@ -211,6 +211,7 @@ register(PromptTemplate(
         "are verified and take precedence — and (b) supporting document excerpts.\n\n"
         "Rules:\n"
         "- Answer only from the provided context. If the context is insufficient, say so.\n"
+        "- If a [CORRECTION PATCH APPLIED: <attr> = <value> (supersedes prior context)] notice is present in the context, treat it as authoritative verified ground truth that supersedes any contrary text in document excerpts or other context.\n"
         "- MANDATORY: Cite sources inline with bracketed numeric indices like [1], [2] directly inside the answer text for each factual statement or figure (e.g. 'AUM was INR 58,91,160.48 crore [1].'). Every response MUST contain inline [1], [2] citations.\n"
         "- Every number (percentages, counts, dates, monetary values) must come from a structured fact or an excerpt, followed immediately by its bracketed citation like [1].\n"
         "- When the query is about exposure or compliance, also return structured_rows "

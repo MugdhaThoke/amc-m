@@ -124,20 +124,57 @@ class AMCDatabaseAdapter(AbstractDatabaseAdapter):
             if row is None:
                 raise KeyError(f"feedback_record not found: {feedback_id!r}")
 
-            # Derive rating
+            # Derive source and rating
+            source = dm.FeedbackSource.ACTIVE
             rating = dm.RatingType.NEGATIVE
-            if row.answer_relevance_score and row.answer_relevance_score >= 4:
+            if not row.actor_id and not row.feedback_text:
+                source = dm.FeedbackSource.PASSIVE
+                rating = dm.RatingType.UNRATED
+            elif row.answer_relevance_score and row.answer_relevance_score >= 4:
                 rating = dm.RatingType.POSITIVE
 
             # Derive feedback type
             feedback_type = dm.FeedbackType.COMPLAINT
-            correction_signals = {"F01", "F02", "F03", "F04"}
-            has_corr_cat = bool(row.selected_categories and any(c in correction_signals for c in row.selected_categories))
-            text_lower = (row.feedback_text or "").lower()
-            has_corr_text = any(w in text_lower for w in ["should be", "is actually", "instead of", "not", "wrong", "incorrect", "correction"])
+            if source == dm.FeedbackSource.PASSIVE:
+                feedback_type = dm.FeedbackType.SILENT_ACCEPT
+            else:
+                correction_signals = {"F01", "F02", "F03", "F04"}
+                has_corr_cat = bool(row.selected_categories and any(c in correction_signals for c in row.selected_categories))
+                text_lower = (row.feedback_text or "").lower()
+                has_corr_text = any(w in text_lower for w in ["should be", "is actually", "instead of", "not", "wrong", "incorrect", "correction"])
 
-            if has_corr_cat or has_corr_text:
-                feedback_type = dm.FeedbackType.CORRECTION
+                if has_corr_cat or has_corr_text:
+                    feedback_type = dm.FeedbackType.CORRECTION
+
+            entity_name = None
+            corrections = None
+            if feedback_type == dm.FeedbackType.CORRECTION and row.feedback_text:
+                try:
+                    from app.feedback.correction_extractor import CorrectionExtractor
+                    extractor = CorrectionExtractor()
+                    claim = extractor.extract_claim(
+                        feedback_text=row.feedback_text,
+                        original_response=row.response_text or "",
+                        original_query=row.query_text or "",
+                    )
+                    if claim:
+                        entity_name = claim.entity_name
+                        corrections = {
+                            "entity_id": claim.entity_id,
+                            "entity_name": claim.entity_name,
+                            "attribute": claim.attribute,
+                            "asserted_value": claim.asserted_value,
+                            "rejected_value": claim.rejected_value,
+                            "confidence": claim.confidence,
+                        }
+                    else:
+                        corrections = {
+                            "feedback_text": row.feedback_text,
+                            "categories": row.selected_categories or [],
+                        }
+                except Exception as ex:
+                    logger.warning("Failed to extract correction claim: %s", ex)
+                    corrections = {"feedback_text": row.feedback_text}
 
             return dm.FeedbackRecord(
                 feedback_id=row.feedback_id,
@@ -146,10 +183,11 @@ class AMCDatabaseAdapter(AbstractDatabaseAdapter):
                 user_id=row.actor_id,
                 rating=rating,
                 feedback_type=feedback_type,
-                source=dm.FeedbackSource.ACTIVE,
+                source=source,
                 received_at=_parse_dt(row.created_at),
                 notes=(row.feedback_text or "")[:2000] if row.feedback_text else None,
-                entity_name=None,
+                entity_name=entity_name,
+                corrections=corrections,
                 ingestion_status=dm.IngestionStatus.PENDING,
             )
 
@@ -187,14 +225,16 @@ class AMCDatabaseAdapter(AbstractDatabaseAdapter):
         # ck_uer_repair_target_consistency: (repair = 0 AND target is NULL) OR (repair = 1 AND target IS NOT NULL)
         root_cause_str = record.root_cause.value if hasattr(record.root_cause, "value") else str(record.root_cause) if record.root_cause else "model"
         
-        repair = False
+        repair = getattr(record, "repair", False)
         repair_target = None
-        if root_cause_str in {"knowledge", "retrieval", "graph"}:
-            repair = True
-            repair_target = "graph"
-        elif root_cause_str == "model":
-            repair = True
-            repair_target = "vector"
+        if repair:
+            target_val = getattr(record, "repair_target", None)
+            if target_val:
+                repair_target = target_val.value if hasattr(target_val, "value") else str(target_val)
+            else:
+                repair_target = "graph" if root_cause_str in {"knowledge", "retrieval", "graph"} else "vector"
+        else:
+            repair_target = None
 
         with self._session_factory() as session:
             # Check if record already exists for response_id
@@ -210,6 +250,22 @@ class AMCDatabaseAdapter(AbstractDatabaseAdapter):
             entry_route_val = record.entry_route.value if hasattr(record.entry_route, "value") else str(record.entry_route)
             severity_val = record.severity.value if hasattr(record.severity, "value") else (str(record.severity) if record.severity else None)
             status_val = record.lifecycle_status.value if hasattr(record.lifecycle_status, "value") else str(record.lifecycle_status or "open")
+
+            raw_verdict = record.adjudication_verdict.value if hasattr(record.adjudication_verdict, "value") else (str(record.adjudication_verdict) if record.adjudication_verdict else None)
+            verdict_val = None
+            if raw_verdict:
+                norm_verdict = raw_verdict.lower().strip()
+                valid_verdicts = {"valid", "partially_valid", "invalid", "subjective", "insufficient_evidence"}
+                if norm_verdict in valid_verdicts:
+                    verdict_val = norm_verdict
+                elif "human" in norm_verdict or "review" in norm_verdict or "inconclusive" in norm_verdict:
+                    verdict_val = "insufficient_evidence"
+                elif "partial" in norm_verdict:
+                    verdict_val = "partially_valid"
+                elif "invalid" in norm_verdict:
+                    verdict_val = "invalid"
+                elif "valid" in norm_verdict:
+                    verdict_val = "valid"
 
             uer = UnifiedEvaluationRecord(
                 session_id=record.session_id,
@@ -227,7 +283,7 @@ class AMCDatabaseAdapter(AbstractDatabaseAdapter):
                 gnn_plausibility_score=record.gnn_plausibility_score,
                 semantic_results=record.semantic_results,
                 llm_evaluation=record.llm_evaluation,
-                adjudication_verdict=record.adjudication_verdict.value if hasattr(record.adjudication_verdict, "value") else (str(record.adjudication_verdict) if record.adjudication_verdict else None),
+                adjudication_verdict=verdict_val,
                 adjudication_confidence=record.adjudication_confidence,
                 created_at=_now_iso(),
                 updated_at=_now_iso(),

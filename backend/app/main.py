@@ -52,6 +52,9 @@ async def lifespan(app: FastAPI):
         log_format=settings.log_format,
         log_file=settings.log_file,
         enable_file_logging=settings.enable_file_logging,
+        json_log_file=settings.json_log_file,
+        enable_json_logging=settings.enable_json_logging,
+        log_dir=settings.log_dir,
     )
 
     # Initialize SQLite database
@@ -149,11 +152,44 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logger.warning("Could not start passive feedback tasks: %s", exc)
 
+    # Start Feedback Loop background services (Retry, Batch Evaluation, Governance Scheduler, Lifecycle Manager)
+    feedback_tasks = []
+    try:
+        from app.services.feedback_retry import start_retry_service
+        from app.evaluation.batch_consumer import start_batch_consumer
+        from app.services.governance_scheduler import start_governance_scheduler
+        from app.services.lifecycle_manager import start_lifecycle_manager
+
+        feedback_tasks.append(asyncio.create_task(start_retry_service()))
+        feedback_tasks.append(asyncio.create_task(start_batch_consumer()))
+        feedback_tasks.append(asyncio.create_task(start_governance_scheduler()))
+        feedback_tasks.append(asyncio.create_task(start_lifecycle_manager()))
+        logger.info("Feedback loop background tasks (retry, batch, governance, lifecycle) started")
+    except Exception as exc:
+        logger.warning("Could not start feedback loop background tasks: %s", exc)
+
     ingest_queue.bind_pipeline(container.pipeline)
     ingest_queue.start()
     logger.info("%s started (env=%s)", settings.app_name, settings.environment)
 
     yield
+
+    # Stop feedback loop background tasks
+    try:
+        from app.services.feedback_retry import stop_retry_service
+        from app.evaluation.batch_consumer import stop_batch_consumer
+        from app.services.governance_scheduler import stop_governance_scheduler
+        from app.services.lifecycle_manager import stop_lifecycle_manager
+        stop_retry_service()
+        stop_batch_consumer()
+        stop_governance_scheduler()
+        stop_lifecycle_manager()
+        for t in feedback_tasks:
+            if not t.done():
+                t.cancel()
+        logger.info("Feedback loop background tasks stopped")
+    except Exception as exc:
+        logger.warning("Error stopping feedback loop background tasks: %s", exc)
 
     # Stop passive feedback background tasks & timers
     try:
@@ -212,6 +248,17 @@ def create_app() -> FastAPI:
     for router in (auth.router, admin.router, query.router, chat.router, sessions.router, taxonomy.router, graph.router,
                    docs.router, ingest.router, status.router, compliance.router, feedback.router, review_queue.router, governance.router, files.router, metrics.router):
         app.include_router(router, prefix="/api")
+
+    # Prometheus /metrics endpoint
+    @app.get("/metrics", tags=["monitoring"], include_in_schema=False)
+    @app.get("/api/metrics/prometheus", tags=["monitoring"], include_in_schema=False)
+    async def prometheus_metrics():
+        try:
+            from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+            from starlette.responses import Response
+            return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+        except Exception as exc:
+            return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
     # Direct response quality alias endpoint
@@ -282,8 +329,8 @@ def create_app() -> FastAPI:
         # so API endpoints are not shadowed by this handler.
         @app.get("/{full_path:path}", include_in_schema=False)
         async def serve_spa(full_path: str):
-            if full_path.startswith("api/") or full_path == "api":
-                return JSONResponse(status_code=404, content={"detail": f"API endpoint /{full_path} not found"})
+            if full_path.startswith("api/") or full_path == "api" or full_path == "metrics" or full_path.startswith("metrics/"):
+                return JSONResponse(status_code=404, content={"detail": f"Endpoint /{full_path} not found"})
             # Serve actual files from the frontend dist directory if they exist
             file_path = frontend_dir / full_path
             if file_path.exists() and file_path.is_file():

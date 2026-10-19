@@ -88,6 +88,33 @@ class TimeoutProcessor:
                 if success:
                     await session_manager.mark_enriched(session_id, response_id)
                     enriched_count += 1
+
+                    # Trigger feedback loop for enriched passive feedback
+                    try:
+                        db_lookup = SessionLocal()
+                        fb_rec = (
+                            db_lookup.query(ResponseFeedback)
+                            .filter(
+                                ResponseFeedback.response_id == response_id,
+                                ResponseFeedback.session_id == session_id,
+                            )
+                            .first()
+                        )
+                        feedback_id = fb_rec.feedback_id if fb_rec else None
+                        db_lookup.close()
+
+                        if feedback_id:
+                            from app.services.feedback import trigger_feedback_loop
+                            await asyncio.to_thread(
+                                trigger_feedback_loop,
+                                feedback_id=feedback_id,
+                                session_id=session_id,
+                                response_id=response_id,
+                                source="passive",
+                            )
+                            logger.info("Triggered feedback loop for passive response %s", response_id)
+                    except Exception as loop_exc:
+                        logger.error("Failed to trigger passive feedback loop for response %s: %s", response_id, loop_exc)
             except Exception as exc:
                 logger.error("Enrichment failed for response %s in session %s: %s", response_id, session_id, exc)
 

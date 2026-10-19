@@ -8,3 +8,5 @@ from app.schemas.query_evidence_table import QueryEvidence
 from app.schemas.response_feedback_table import ResponseFeedback
 from app.schemas.unified_evaluation_records_table import UnifiedEvaluationRecord
 from app.schemas.violations_table import Violation
+from app.schemas.repair_proposals import RepairProposal
+from app.schemas.graph_mutations_table import GraphMutation

@@ -713,6 +713,8 @@ def submit_feedback(
             clear_pending_feedback_cache(suppress_prior_feedbacks=False)
             if issue_id:
                 get_feedback_cache().invalidate_issue(issue_id)
+            from app.retrieval.cache import get_semantic_cache
+            get_semantic_cache().clear()
         except Exception as cache_err:
             logger.debug("Failed to clear feedback cache in submit_feedback: %s", cache_err)
         

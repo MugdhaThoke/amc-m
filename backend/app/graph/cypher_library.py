@@ -75,11 +75,14 @@ RETURN d.document_id AS document_id, d.name AS title, d.category AS category
 
 # 8. Single-entity neighborhood facts (fallback for entity_lookup queries).
 ENTITY_FACTS = """
-MATCH (e {name: $entity_name})-[r]-(other)
-WHERE other.name IS NOT NULL
-RETURN e.name AS entity, type(r) AS rel_type,
+MATCH (e)-[r]-(other)
+WHERE (coalesce(e.name, e.text) = $entity_name 
+   OR toLower(coalesce(e.name, e.text, '')) = toLower($entity_name)
+   OR toLower(coalesce(e.name, e.text, '')) CONTAINS toLower($entity_name))
+  AND coalesce(other.name, other.text) IS NOT NULL
+RETURN coalesce(e.name, e.text) AS entity, type(r) AS rel_type,
        CASE WHEN startNode(r) = e THEN 'out' ELSE 'in' END AS direction,
-       other.name AS other, labels(other)[0] AS other_type,
+       coalesce(other.name, other.text) AS other, labels(other)[0] AS other_type,
        properties(r) AS props
 LIMIT 50
 """

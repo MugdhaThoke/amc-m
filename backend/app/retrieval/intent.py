@@ -75,11 +75,12 @@ class IntentClassifier:
         q_type = QueryType(result["query_type"])
         requires_cypher = is_agg or (q_type == QueryType.EXPOSURE_AGGREGATION)
 
+        ents = result.get("entities_mentioned", [])
         return QueryIntent(
             query_type=q_type,
-            entities_mentioned=result.get("entities_mentioned", []),
+            entities_mentioned=ents,
             taxonomy_paths=paths,
-            requires_graph=result.get("requires_graph", True) or requires_cypher,
+            requires_graph=bool(result.get("requires_graph")) or requires_cypher or (q_type != QueryType.GENERAL) or bool(ents),
             requires_vector=result.get("requires_vector", True),
             requires_cypher=requires_cypher,
             aggregation_type=agg_type,

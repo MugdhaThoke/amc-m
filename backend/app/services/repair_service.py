@@ -33,6 +33,12 @@ from app.feedback.fund_name_matcher import get_fund_name_matcher
 from app.graph.correction_patch_layer import get_correction_patch_layer
 from app.schemas.unified_evaluation_records_table import UnifiedEvaluationRecord
 from app.schemas.query_evidence_table import QueryEvidence
+from app.core.logging import (
+    log_step_info,
+    log_step_warning,
+    log_step_error,
+    log_step_debug,
+)
 
 logger = logging.getLogger("app.services.repair")
 
@@ -85,7 +91,7 @@ def extract_corrections_from_evidence(
                        dissatisfaction_evidence.get("user_feedback", "")
         
         if feedback_text and len(corrections) == 0:
-            logger.info("Parsing feedback text for corrections: %s", feedback_text[:100])
+            log_step_info(logger, "PARSE_FEEDBACK_TEXT", "Parsing feedback text for corrections: %s", feedback_text[:100])
             extractor = CorrectionExtractor()
             claim = extractor.extract_claim(
                 feedback_text=feedback_text,
@@ -130,11 +136,11 @@ def resolve_entity_id(
             user_context=query_text
         )
         if result and result.resolved_id:
-            logger.info("Resolved entity '%s' → %s (confidence=%.2f)",
+            log_step_info(logger, "RESOLVE_ENTITY", "Resolved entity '%s' → %s (confidence=%.2f)",
                        entity_name, result.resolved_id, result.confidence)
             return result.resolved_id
     except Exception as exc:
-        logger.debug("Entity resolution error for '%s': %s", entity_name, exc)
+        log_step_debug(logger, "RESOLVE_ENTITY_NOTICE", "Entity resolution error for '%s': %s", entity_name, exc)
     
     return None
 
@@ -164,18 +170,18 @@ def create_patch_from_correction(
         )
     
     if not entity_id:
-        logger.warning("Could not resolve entity ID for correction: %s", correction)
+        log_step_warning(logger, "RESOLVE_ENTITY_FAILED", "Could not resolve entity ID for correction: %s", correction)
         return None
     
     attribute = correction.get("attribute")
     if not attribute:
-        logger.warning("Correction has no attribute; skipping")
+        log_step_warning(logger, "CREATE_PATCH_NO_ATTR", "Correction has no attribute; skipping")
         return None
     
     # Asserted value takes priority; if not present, reject_value indicates what's wrong
     corrected_value = correction.get("asserted_value") or correction.get("rejected_value")
     if not corrected_value:
-        logger.warning("Correction has neither asserted nor rejected value")
+        log_step_warning(logger, "CREATE_PATCH_NO_VAL", "Correction has neither asserted nor rejected value")
         return None
     
     # Canonical value is the rejected/original value
@@ -198,7 +204,9 @@ def create_patch_from_correction(
             approved=False
         )
         
-        logger.info(
+        log_step_info(
+            logger,
+            "CREATE_PATCH",
             "Created correction patch %s: %s.%s %s → %s (confidence=%.2f)",
             patch_id, entity_id, attribute, canonical_value, corrected_value,
             correction.get("confidence", 0.70)
@@ -206,7 +214,7 @@ def create_patch_from_correction(
         return patch_id
     
     except Exception as exc:
-        logger.error("Failed to create patch for correction %s: %s", correction, exc, exc_info=True)
+        log_step_error(logger, "CREATE_PATCH_ERROR", "Failed to create patch for correction %s: %s", correction, exc)
         return None
 
 
@@ -241,14 +249,12 @@ def process_unified_record_for_repair(
         "record_id": response_id
     }
     
-    logger.info("=" * 80)
-    logger.info("🔧 REPAIR SERVICE: Processing unified record for response_id=%s", response_id)
-    logger.info("=" * 80)
+    log_step_info(logger, "REPAIR_SERVICE_START", "Processing unified record for response_id=%s", response_id)
     
     local_db = db or SessionLocal()
     try:
         # 1. Fetch the unified evaluation record
-        logger.debug("Fetching unified evaluation record for response_id=%s", response_id)
+        log_step_debug(logger, "FETCH_RECORD", "Fetching unified evaluation record for response_id=%s", response_id)
         record = local_db.query(UnifiedEvaluationRecord)\
             .filter(UnifiedEvaluationRecord.response_id == response_id)\
             .first()
@@ -256,41 +262,36 @@ def process_unified_record_for_repair(
         if not record:
             error_msg = f"Unified record not found for response_id={response_id}"
             result["errors"].append(error_msg)
-            logger.warning("❌ %s", error_msg)
-            logger.info("=" * 80)
+            log_step_warning(logger, "FETCH_RECORD_NOT_FOUND", "%s", error_msg)
             return result
         
-        logger.info("✅ Unified record found")
-        logger.info("   Entry Route: %s", record.entry_route)
-        logger.info("   Root Cause: %s", record.root_cause)
-        logger.info("   Repair Required: %s", record.repair)
-        logger.info("   Repair Target: %s", record.repair_target)
+        log_step_info(logger, "RECORD_FOUND", "Unified record found: entry_route=%s, root_cause=%s, repair=%s, repair_target=%s",
+                      record.entry_route, record.root_cause, record.repair, record.repair_target)
         
         # 2. Check if repair is needed
         if not record.repair:
-            logger.info("⏭️  Record does not require repair; skipping")
-            logger.info("=" * 80)
+            log_step_info(logger, "REPAIR_SKIPPED", "Record does not require repair; skipping")
+            result["success"] = True
             return result
         
-        logger.info("🚀 Processing repair for response_id=%s", response_id)
+        log_step_info(logger, "REPAIR_PROCESSING", "Processing repair for response_id=%s", response_id)
         
         # 3. Fetch query evidence for context
         query_text = ""
         response_text = ""
         try:
-            logger.debug("Fetching query evidence for context...")
             evidence = local_db.query(QueryEvidence)\
                 .filter(QueryEvidence.response_id == response_id)\
                 .first()
             if evidence:
                 query_text = evidence.query_text or ""
                 response_text = evidence.assembled_context_json or "" if evidence.assembled_context_json else ""
-                logger.debug("✅ Query evidence found (query_len=%d)", len(query_text))
+                log_step_debug(logger, "FETCH_EVIDENCE", "Query evidence found (query_len=%d)", len(query_text))
         except Exception as exc:
-            logger.debug("Could not fetch query evidence for context: %s", exc)
+            log_step_debug(logger, "FETCH_EVIDENCE_NOTICE", "Could not fetch query evidence for context: %s", exc)
         
         # 4. Extract corrections from dissatisfaction evidence
-        logger.info("📋 Extracting corrections from dissatisfaction evidence...")
+        log_step_info(logger, "CORRECTION_EXTRACTION", "Extracting corrections from dissatisfaction evidence...")
         corrections = extract_corrections_from_evidence(
             dissatisfaction_evidence=record.dissatisfaction_evidence_json,
             query_text=query_text,
@@ -298,14 +299,13 @@ def process_unified_record_for_repair(
         )
         
         if not corrections:
-            logger.info("⚠️  No corrections extracted from record")
+            log_step_info(logger, "NO_CORRECTIONS", "No corrections extracted from record %s", response_id)
             result["success"] = True
-            logger.info("=" * 80)
             return result
         
-        logger.info("✅ Extracted %d correction(s)", len(corrections))
+        log_step_info(logger, "CORRECTIONS_EXTRACTED", "Extracted %d correction(s) for response_id=%s", len(corrections), response_id)
         for idx, corr in enumerate(corrections, 1):
-            logger.info("   [%d] %s.%s: %s → %s (conf=%.2f)",
+            log_step_debug(logger, "CORRECTION_DETAIL", "[%d] %s.%s: %s → %s (conf=%.2f)",
                        idx,
                        corr.get("entity_id", "unknown"),
                        corr.get("attribute", "unknown"),
@@ -314,7 +314,7 @@ def process_unified_record_for_repair(
                        corr.get("confidence", 0))
         
         # 5. Create patches for each correction
-        logger.info("🛠️  Creating patches...")
+        log_step_info(logger, "PATCH_CREATION", "Creating patches from %d correction(s)...", len(corrections))
         for correction in corrections:
             try:
                 patch_id = create_patch_from_correction(
@@ -325,30 +325,24 @@ def process_unified_record_for_repair(
                 if patch_id:
                     result["patches"].append(patch_id)
                     result["patches_created"] += 1
-                    logger.info("✅ Patch created: %s", patch_id)
+                    log_step_info(logger, "PATCH_CREATED", "Patch created: %s", patch_id)
                 else:
                     error_msg = f"Failed to create patch for correction: {correction}"
                     result["errors"].append(error_msg)
-                    logger.warning("❌ %s", error_msg)
+                    log_step_warning(logger, "PATCH_FAILED", "%s", error_msg)
             except Exception as exc:
                 error_msg = f"Exception creating patch: {exc}"
                 result["errors"].append(error_msg)
-                logger.error("❌ %s", error_msg, exc_info=True)
+                log_step_error(logger, "PATCH_EXCEPTION", "%s", error_msg)
         
         result["success"] = True
-        logger.info("=" * 80)
-        logger.info("✅ REPAIR SERVICE COMPLETE")
-        logger.info("   Patches Created: %d", result["patches_created"])
-        logger.info("   Response ID: %s", response_id)
-        logger.info("=" * 80)
+        log_step_info(logger, "REPAIR_SERVICE_COMPLETE", "Repair service complete for %s (patches_created=%d)", response_id, result["patches_created"])
         return result
     
     except Exception as exc:
         error_msg = f"Repair processing failed: {exc}"
         result["errors"].append(error_msg)
-        logger.error("=" * 80)
-        logger.error("❌ %s", error_msg, exc_info=True)
-        logger.error("=" * 80)
+        log_step_error(logger, "REPAIR_SERVICE_ERROR", "%s", error_msg)
         return result
     
     finally:

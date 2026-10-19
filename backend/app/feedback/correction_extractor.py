@@ -66,7 +66,8 @@ class CorrectionExtractor:
         "ALPHA": ["alpha"],
         "BETA": ["beta"],
         "RISK_GRADE": ["risk", "risk grade", "risk category"],
-        "BENCHMARK": ["benchmark", "index"]
+        "BENCHMARK": ["benchmark", "index"],
+        "CATEGORY": ["category", "fund category", "cap category", "cap type", "market cap", "fund type"]
     }
 
     def __init__(self, spacy_model: str = "en_core_web_sm"):
@@ -149,6 +150,25 @@ class CorrectionExtractor:
         elif response_numbers:
             # If user said "TER is wrong" without asserting a number
             rejected_value = str(response_numbers[0])
+        else:
+            # Heuristic 2: Categorical / textual correction extraction ("actually X, not Y" or "should be X, not Y")
+            text_match = re.search(
+                r"(?:actually|is\s+actually|should\s+be|is)\s+([A-Za-z0-9\s]+?)(?:,\s*not|\s+not|\s+instead\s+of)\s+([A-Za-z0-9\s]+?)(?:\.|$)",
+                feedback_text,
+                re.IGNORECASE
+            )
+            if text_match:
+                asserted_value = text_match.group(1).strip()
+                rejected_value = text_match.group(2).strip()
+            else:
+                text_match_b = re.search(
+                    r"\b([A-Za-z0-9\s]+?)\s+instead\s+of\s+([A-Za-z0-9\s]+?)(?:\.|$)",
+                    feedback_text,
+                    re.IGNORECASE
+                )
+                if text_match_b:
+                    asserted_value = text_match_b.group(1).strip()
+                    rejected_value = text_match_b.group(2).strip()
 
         # Entity extraction from original query or feedback
         entity_name = self._extract_entity(original_query) or self._extract_entity(feedback_text)

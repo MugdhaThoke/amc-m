@@ -136,8 +136,8 @@ ENABLE_PARALLELIZATION = os.environ.get("ENABLE_PARALLELIZATION", "true").lower(
 ENABLE_QUERY_DECOMPOSITION = os.environ.get("ENABLE_QUERY_DECOMPOSITION", "true").lower() == "true"
 
 # ── EVALUATION TIER FEATURE FLAGS ──────────────────────────────────────
-ENABLE_TIER2_NLI_EVALUATION = os.environ.get("ENABLE_TIER2_NLI_EVALUATION", "false").lower() == "true"
-ENABLE_TIER3_LLM_JUDGE = os.environ.get("ENABLE_TIER3_LLM_JUDGE", "false").lower() == "true"
+ENABLE_TIER2_NLI_EVALUATION = os.environ.get("ENABLE_TIER2_NLI_EVALUATION", "true").lower() == "true"
+ENABLE_TIER3_LLM_JUDGE = os.environ.get("ENABLE_TIER3_LLM_JUDGE", "true").lower() == "true"
 TIER2_NLI_CONFIDENCE_THRESHOLD = float(os.environ.get("TIER2_NLI_CONFIDENCE_THRESHOLD", "0.85"))
 TIER3_LLM_SEVERITY_THRESHOLD = os.environ.get("TIER3_LLM_SEVERITY_THRESHOLD", "HIGH")
 

@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session as DBSession
 
 from app.api.deps import CurrentUser
@@ -105,64 +106,65 @@ def _verify_session_ownership(
 @router.get("", response_model=List[SessionItem])
 async def list_sessions(
     current_user: CurrentUser,
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=100),
     db: DBSession = Depends(get_db),
 ) -> List[SessionItem]:
     """
     List saved chat sessions for the CURRENT USER ONLY.
 
     Authorization: Only returns sessions where user_id matches the authenticated user.
-    Sorted by created_at (newest first), up to limit (default 20).
+    Sorted by updated_at / created_at (newest first), up to limit (default 50).
     """
     query = db.query(ChatSession).filter(ChatSession.user_id == current_user.username)
     if current_user.tenant_id:
         query = query.filter(ChatSession.tenant_id == current_user.tenant_id)
-    query = query.order_by(ChatSession.created_at.desc()).limit(limit)
+    query = query.order_by(
+        func.coalesce(ChatSession.updated_at, ChatSession.created_at).desc()
+    ).limit(limit)
 
     sessions = query.all()
 
     results: List[SessionItem] = []
     for session in sessions:
         path = _get_session_path(session.session_id)
-        if not path.exists():
-            continue
+        if path.exists():
+            try:
+                content = path.read_text(encoding="utf-8")
+                data = json.loads(content)
 
-        try:
-            content = path.read_text(encoding="utf-8")
-            data = json.loads(content)
+                history = data if isinstance(data, list) else data.get("history", [])
 
-            history = data if isinstance(data, list) else data.get("history", [])
+                first_query = ""
+                for turn in history:
+                    if isinstance(turn, dict) and turn.get("role") == "user":
+                        content_val = turn.get("content", "")
+                        if isinstance(content_val, str) and content_val.strip():
+                            first_query = content_val.strip()
+                            break
 
-            first_query = ""
-            for turn in history:
-                if isinstance(turn, dict) and turn.get("role") == "user":
-                    content_val = turn.get("content", "")
-                    if isinstance(content_val, str) and content_val.strip():
-                        first_query = content_val.strip()
-                        break
+                if not first_query:
+                    continue
 
-            if not first_query:
+                preview = first_query[:44] + "…" if len(first_query) > 45 else first_query
+                raw_title = data.get("title") if isinstance(data, dict) else None
+                title = raw_title if (raw_title and raw_title.strip() and raw_title != "New Conversation") else preview
+
+                turn_count = len([t for t in history if isinstance(t, dict) and t.get("role") == "user"])
+
+                results.append(
+                    SessionItem(
+                        session_id=session.session_id,
+                        preview=preview,
+                        title=title,
+                        turn_count=turn_count,
+                        modified_time=path.stat().st_mtime if path.exists() else None,
+                        created_at=session.created_at,
+                        updated_at=session.updated_at,
+                    )
+                )
+            except Exception:
                 continue
 
-            preview = first_query[:44] + "…" if len(first_query) > 45 else first_query
-            raw_title = data.get("title") if isinstance(data, dict) else None
-            title = raw_title if (raw_title and raw_title.strip() and raw_title != "New Conversation") else preview
-
-            turn_count = len([t for t in history if isinstance(t, dict) and t.get("role") == "user"])
-
-            results.append(
-                SessionItem(
-                    session_id=session.session_id,
-                    preview=preview,
-                    title=title,
-                    turn_count=turn_count,
-                    modified_time=path.stat().st_mtime if path.exists() else None,
-                    created_at=session.created_at,
-                    updated_at=session.updated_at,
-                )
-            )
-        except Exception:
-            continue
 
     return results
 
@@ -180,6 +182,41 @@ async def get_session(
 
     path = _get_session_path(session_id)
     if not path.exists():
+        # Resilient fallback to query_evidence
+        try:
+            from app.schemas.query_evidence_table import QueryEvidence
+            evidence_turns = (
+                db.query(QueryEvidence)
+                .filter(QueryEvidence.session_id == session_id)
+                .order_by(QueryEvidence.response_id.asc())
+                .all()
+            )
+            if evidence_turns:
+                history = []
+                for i, ev in enumerate(evidence_turns):
+                    history.append({
+                        "role": "user",
+                        "content": ev.query_text,
+                        "turn_index": i + 1,
+                    })
+                    ans = ev.synthesis_output_json.get("answer") if isinstance(ev.synthesis_output_json, dict) else str(ev.synthesis_output_json)
+                    history.append({
+                        "role": "assistant",
+                        "content": ans or "",
+                        "turn_index": i + 1,
+                        "response_id": ev.response_id,
+                    })
+                first_q = history[0]["content"][:44] if history else "Conversation"
+                return {
+                    "session_id": session_id,
+                    "id": session_id,
+                    "history": history,
+                    "user_id": session_record.user_id,
+                    "title": first_q,
+                }
+        except Exception:
+            pass
+
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session {session_id} not found",

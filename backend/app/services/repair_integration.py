@@ -28,6 +28,12 @@ import httpx
 from app.config import get_settings
 from app.schemas.unified_evaluation_records_table import UnifiedEvaluationRecord
 from sqlalchemy.orm import Session
+from app.core.logging import (
+    log_step_info,
+    log_step_warning,
+    log_step_error,
+    log_step_debug,
+)
 
 logger = logging.getLogger("app.services.repair_integration")
 
@@ -78,8 +84,10 @@ class RepairEngineIntegration:
             logger.debug("No correction claims in evidence for %s, skipping", record.response_id)
             return {"success": False, "reason": "no_correction_claims"}
         
-        logger.info(
-            "🚀 REPAIR ENGINE TRIGGER: Processing %d correction(s) for response_id=%s",
+        log_step_info(
+            logger,
+            "REPAIR_TRIGGER",
+            "Processing %d correction(s) for response_id=%s",
             len(correction_claims),
             record.response_id
         )
@@ -104,8 +112,10 @@ class RepairEngineIntegration:
                     if patch_response:
                         patch_id = patch_response.get("patch_id")
                         result["patches_created"].append(patch_id)
-                        logger.info(
-                            "✅ Patch %d/%d created: %s (entity=%s, attr=%s)",
+                        log_step_info(
+                            logger,
+                            "PATCH_CREATED",
+                            "Patch %d/%d created: %s (entity=%s, attr=%s)",
                             idx,
                             len(correction_claims),
                             patch_id,
@@ -114,7 +124,9 @@ class RepairEngineIntegration:
                         )
                     else:
                         result["patches_failed"].append(claim)
-                        logger.warning(
+                        log_step_warning(
+                            logger,
+                            "PATCH_FAILED",
                             "Patch %d/%d failed to create for %s.%s",
                             idx,
                             len(correction_claims),
@@ -126,20 +138,78 @@ class RepairEngineIntegration:
                     error_msg = f"Exception creating patch: {exc}"
                     result["patches_failed"].append(claim)
                     result["errors"].append(error_msg)
-                    logger.error(
+                    log_step_error(
+                        logger,
+                        "PATCH_ERROR",
                         "Patch %d/%d exception: %s",
                         idx,
                         len(correction_claims),
                         exc
                     )
         
-        logger.info(
-            "REPAIR ENGINE RESULT: response_id=%s, created=%d, failed=%d",
+        log_step_info(
+            logger,
+            "REPAIR_RESULT",
+            "Repair engine result: response_id=%s, created=%d, failed=%d",
             record.response_id,
             len(result["patches_created"]),
             len(result["patches_failed"])
         )
-        
+
+        if result["patches_created"]:
+            try:
+                from app.retrieval.cache import get_semantic_cache
+                get_semantic_cache().clear()
+                log_step_info(logger, "CACHE_CLEARED", "Semantic cache cleared following patch creation for %s", record.response_id)
+            except Exception as cache_exc:
+                log_step_debug(logger, "CACHE_CLEAR_NOTICE", "Could not clear semantic cache: %s", cache_exc)
+
+            # Option 3: Ingest synthetic patch chunk into vector store
+            try:
+                from app.vector.client import get_base_vector_store
+                vstore = get_base_vector_store()
+                for patch_id, claim in zip(result["patches_created"], correction_claims):
+                    entity = claim.get("entity_id") or claim.get("entity_name") or "Fund"
+                    attr = claim.get("attribute") or "general"
+                    val = claim.get("asserted_value")
+                    await vstore.ingest_synthetic_patch_chunk(
+                        patch_id=patch_id,
+                        entity_id=entity,
+                        attribute=attr,
+                        value=val,
+                    )
+            except Exception as v_exc:
+                logger.debug("Option 3 synthetic chunk ingestion notice: %s", v_exc)
+
+            # Hands-Free Auto-Approval: automatically promote high-confidence (>= 0.95) & LOW-risk patches
+            for patch_id, claim in zip(result["patches_created"], correction_claims):
+                try:
+                    conf = float(claim.get("confidence", 0.0))
+                    if conf >= 0.95:
+                        from app.api.routes.governance import assess_risk_level
+                        risk = assess_risk_level(conf, claim.get("rejected_value"), claim.get("asserted_value"))
+                        if risk == "LOW":
+                            log_step_info(logger, "HANDS_FREE_AUTO_APPROVE", "Hands-free auto-promoting patch %s (conf=%.2f, risk=LOW)", patch_id, conf)
+                            from app.graph.correction_patch_layer import get_correction_patch_layer
+                            from app.engine.graph_store import get_driver, config as g_config
+                            p_layer = get_correction_patch_layer()
+                            n_session = None
+                            try:
+                                driver = get_driver()
+                                if driver:
+                                    n_session = driver.session(database=getattr(g_config, "NEO4J_DATABASE", "neo4j"))
+                                p_layer.promote_to_permanent(patch_id, neo4j_session=n_session)
+                            finally:
+                                if n_session:
+                                    try:
+                                        n_session.close()
+                                    except Exception:
+                                        pass
+                            await self.promote_patch(patch_id)
+                            result.setdefault("auto_approved", []).append(patch_id)
+                except Exception as auto_exc:
+                    logger.debug("Hands-free auto-approval notice: %s", auto_exc)
+
         return result
     
     async def _create_patch_via_api(
@@ -162,8 +232,8 @@ class RepairEngineIntegration:
         url = f"{self.repair_service_url}/api/patches"
         
         payload = {
-            "entity_id": claim.get("entity_id"),
-            "attribute": claim.get("attribute"),
+            "entity_id": claim.get("entity_id") or claim.get("entity_name") or "unknown_entity",
+            "attribute": claim.get("attribute") or "general",
             "canonical_value": claim.get("rejected_value"),
             "corrected_value": claim.get("asserted_value"),
             "confidence": float(claim.get("confidence", 0.75)),
@@ -264,13 +334,15 @@ class RepairEngineIntegration:
             payload = {"auto_approve_threshold": auto_approve_threshold}
             
             async with httpx.AsyncClient(timeout=60.0) as client:
-                logger.info("Starting governance batch with threshold=%.2f", auto_approve_threshold)
+                log_step_info(logger, "GOVERNANCE_START", "Starting governance batch with threshold=%.2f", auto_approve_threshold)
                 
                 response = await client.post(url, json=payload)
                 
                 if response.status_code == 200:
                     result = response.json()
-                    logger.info(
+                    log_step_info(
+                        logger,
+                        "GOVERNANCE_COMPLETE",
                         "Governance batch completed: evaluated=%d, approved=%d, deployed=%d",
                         result.get("total_evaluated", 0),
                         result.get("approved", 0),
@@ -278,12 +350,25 @@ class RepairEngineIntegration:
                     )
                     return result
                 else:
-                    logger.warning("Governance batch failed: HTTP %d", response.status_code)
+                    log_step_warning(logger, "GOVERNANCE_WARN", "Governance batch failed: HTTP %d", response.status_code)
                     return None
         
         except Exception as exc:
-            logger.error("Governance batch error: %s", exc)
+            log_step_error(logger, "GOVERNANCE_ERROR", "Governance batch error: %s", exc)
             return None
+
+    async def promote_patch(self, patch_id: str) -> bool:
+        """Trigger canonical promotion of patch on repair service."""
+        if not self.repair_service_url:
+            return False
+        try:
+            url = f"{self.repair_service_url}/api/governance/promote/{patch_id}"
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                res = await client.post(url)
+                return res.status_code == 200
+        except Exception as exc:
+            log_step_warning(logger, "PROMOTE_PATCH_WARN", "Error calling promote_patch on repair engine: %s", exc)
+            return False
 
 
 # Singleton instance
@@ -307,7 +392,9 @@ async def trigger_repair_on_feedback(
     
     Called from feedback.py after UnifiedEvaluationRecord is created.
     """
-    logger.info(
+    log_step_info(
+        logger,
+        "REPAIR_INTEGRATION_INVOKED",
         "Repair integration called: response_id=%s, repair=%s, root_cause=%s",
         record.response_id,
         record.repair,

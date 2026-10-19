@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
-from amc_feedback import FeedbackConfig, FeedbackLoop, SQLiteAdapter as FeedbackSQLiteAdapter
+from feedback_loop import FeedbackConfig, FeedbackLoop, SQLiteAdapter as FeedbackSQLiteAdapter
 from amc_repair import RepairConfig, RepairEngine, MemoryCacheAdapter, GraphAdapter, MemoryGraphAdapter
 
 from app.core.database import BASE_DIR
@@ -74,6 +74,48 @@ class PlatformNeo4jGraphAdapter(GraphAdapter):
         except Exception as exc:
             logger.error("Failed to query entity property from Neo4j: %s", exc)
             return None
+
+    async def create_shadow_patch(self, entity_id: str, patch_id: str, attribute: str, value: Any) -> bool:
+        driver = self._get_driver()
+        if not driver:
+            return False
+        try:
+            cypher = """
+            MATCH (e) WHERE e.isin = $entity_id OR e.id = $entity_id OR e.name = $entity_id
+            MERGE (p:ShadowPatch {patch_id: $patch_id})
+            SET p.name = $attribute + ' = ' + toString($value),
+                p.attribute = $attribute,
+                p.corrected_value = $value,
+                p.status = 'approved',
+                p.created_at = datetime()
+            MERGE (e)-[r:HAS_PATCH {attribute: $attribute}]->(p)
+            RETURN count(p) AS created
+            """
+            with driver.session(database=self.database) as session:
+                res = session.run(cypher, entity_id=entity_id, patch_id=patch_id, attribute=attribute, value=str(value))
+                record = res.single()
+                return bool(record and record["created"] > 0)
+        except Exception as exc:
+            logger.error("Failed to create shadow patch in Neo4j: %s", exc)
+            return False
+
+    async def delete_shadow_patch(self, patch_id: str) -> bool:
+        driver = self._get_driver()
+        if not driver:
+            return False
+        try:
+            cypher = """
+            MATCH (p:ShadowPatch {patch_id: $patch_id})
+            DETACH DELETE p
+            RETURN count(p) AS deleted
+            """
+            with driver.session(database=self.database) as session:
+                res = session.run(cypher, patch_id=patch_id)
+                record = res.single()
+                return bool(record and record["deleted"] > 0)
+        except Exception as exc:
+            logger.error("Failed to delete shadow patch in Neo4j: %s", exc)
+            return False
 
     async def close(self):
         if self._driver:

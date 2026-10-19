@@ -22,6 +22,12 @@ from app.adapters.feedback_adapters import AMCDatabaseAdapter, AMCEvidenceAdapte
 from app.core.database import SessionLocal
 from app.schemas.unified_evaluation_records_table import UnifiedEvaluationRecord
 from app.services.repair_service import process_unified_record_for_repair_sync
+from app.core.logging import (
+    log_step_info,
+    log_step_warning,
+    log_step_error,
+    log_step_debug,
+)
 
 logger = logging.getLogger("app.services.feedback")
 
@@ -56,7 +62,9 @@ def trigger_feedback_loop(
     Returns:
         UnifiedEvaluationRecord if created, else None
     """
-    logger.info(
+    log_step_info(
+        logger,
+        "FEEDBACK_LOOP_START",
         "FEEDBACK LOOP START: feedback_id=%s, response_id=%s, session_id=%s, source=%s",
         feedback_id,
         response_id,
@@ -75,13 +83,13 @@ def trigger_feedback_loop(
                 .first()
             )
             if not has_evidence:
-                logger.info("QueryEvidence not present for response_id=%s, skipping deep loop", response_id)
+                log_step_info(logger, "FEEDBACK_LOOP_SKIP", "QueryEvidence not present for response_id=%s, skipping deep loop", response_id)
                 return None
         finally:
             if db is None:
                 check_db.close()
 
-        logger.info("Running feedback loop pipeline (Steps 1-4)...")
+        log_step_info(logger, "FEEDBACK_LOOP_EXEC", "Running feedback loop pipeline (Steps 1-4)...")
         success = start_feedback_loop(
             feedback_id=feedback_id,
             session_id=session_id,
@@ -91,7 +99,7 @@ def trigger_feedback_loop(
             db=_db_adapter,
             evidence_adapter=_evidence_adapter,
         )
-        logger.info("Feedback loop pipeline completed: success=%s", success)
+        log_step_info(logger, "FEEDBACK_LOOP_COMPLETE", "Feedback loop pipeline completed: success=%s", success)
 
         # Retrieve the generated UnifiedEvaluationRecord
         local_db = db or SessionLocal()
@@ -103,17 +111,21 @@ def trigger_feedback_loop(
             )
             
             if not record:
-                logger.warning("⚠️  No UnifiedEvaluationRecord created for response_id=%s", response_id)
+                log_step_warning(logger, "NO_UNIFIED_RECORD", "No UnifiedEvaluationRecord created for response_id=%s", response_id)
                 return None
             
-            logger.info(
+            log_step_info(
+                logger,
+                "UNIFIED_RECORD_CREATED",
                 "Unified record created: entry_route=%s, root_cause=%s, severity=%s, repair=%s",
                 record.entry_route, record.root_cause, record.severity, record.repair
             )
             
             # NEW: If repair is flagged, trigger repair engine microservice
             if process_repair and record.repair:
-                logger.info(
+                log_step_info(
+                    logger,
+                    "REPAIR_FLAGGED",
                     "REPAIR FLAGGED: response_id=%s, root_cause=%s, repair_target=%s",
                     response_id, record.root_cause, record.repair_target
                 )
@@ -122,25 +134,41 @@ def trigger_feedback_loop(
                     import asyncio
                     from app.services.repair_integration import trigger_repair_on_feedback
                     
-                    # Run async repair trigger synchronously
-                    repair_result = asyncio.run(trigger_repair_on_feedback(record, db=local_db))
+                    # Run async repair trigger safely
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        loop = None
+
+                    if loop and loop.is_running():
+                        import concurrent.futures
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            repair_result = pool.submit(asyncio.run, trigger_repair_on_feedback(record, db=local_db)).result()
+                    else:
+                        repair_result = asyncio.run(trigger_repair_on_feedback(record, db=local_db))
                     
-                    logger.info(
+                    log_step_info(
+                        logger,
+                        "REPAIR_INTEGRATION_RESULT",
                         "Repair engine integration result: success=%s, patches=%d",
                         repair_result.get("success"),
                         len(repair_result.get("patches_created", []))
                     )
                     
                     if repair_result.get("patches_created"):
-                        logger.info(
+                        log_step_info(
+                            logger,
+                            "PATCHES_CREATED",
                             "Patches created via repair engine: %s",
                             repair_result["patches_created"]
                         )
                 
                 except Exception as repair_exc:
-                    logger.error(
+                    log_step_error(
+                        logger,
+                        "REPAIR_INTEGRATION_ERROR",
                         "Repair engine integration error: %s",
-                        repair_exc, exc_info=True
+                        repair_exc,
                     )
             
             return record
@@ -149,10 +177,11 @@ def trigger_feedback_loop(
                 local_db.close()
 
     except Exception as exc:
-        logger.error(
+        log_step_error(
+            logger,
+            "FEEDBACK_LOOP_FAILED",
             "trigger_feedback_loop FAILED: feedback_id=%s, error: %s",
             feedback_id,
             exc,
-            exc_info=True,
         )
         raise

@@ -129,6 +129,18 @@ class EvaluationRouter:
             for r in rule_results
         ]
 
+        # ── Tier 1B: GNN Structural Plausibility ─────────────────────────
+        gnn_score = 0.5
+        try:
+            from app.evaluation.gnn_plausibility import get_gnn_scorer
+            scorer = get_gnn_scorer()
+            entity_id = evidence_pack.get("entity_name") or evidence_pack.get("entity_id") or "UNKNOWN"
+            attr = evidence_pack.get("attribute", "attribute")
+            val = str(evidence_pack.get("claimed_value") or evidence_pack.get("value", ""))
+            gnn_score = scorer.score(entity_id=entity_id, attribute=attr, value=val)
+        except Exception as gnn_exc:
+            logger.warning("Tier 1B GNN scoring exception: %s", gnn_exc)
+
         # Check STOP-1 failure gate
         if self.rule_engine.should_stop(rule_results):
             failed_rules = [r for r in rule_results if r.verdict == RuleVerdict.FAIL and r.confidence >= 0.9]
@@ -140,6 +152,7 @@ class EvaluationRouter:
                 "verdict": "FAIL",
                 "tier": "T1A_RULES",
                 "confidence": 1.0,
+                "gnn_plausibility_score": gnn_score,
                 "llm_tokens_used": 0,
                 "rule_results": serialized_rules,
                 "explanation": fail_explanation,
@@ -157,6 +170,7 @@ class EvaluationRouter:
                 "verdict": "PASS",
                 "tier": "T1A_RULES",
                 "confidence": 1.0,
+                "gnn_plausibility_score": gnn_score,
                 "llm_tokens_used": 0,
                 "rule_results": serialized_rules,
                 "explanation": "All deterministic compliance and accuracy rules passed",
@@ -166,6 +180,7 @@ class EvaluationRouter:
         logger.info("Tier 1A inconclusive for response %s; evaluating Tier 2/3 escalation", response_id)
 
         # ── Tier 2: NLI Semantic Alignment ──────────────────────────────
+        nli_result = None
         if self.is_tier2_enabled:
             try:
                 from app.evaluation.nli_evaluator import get_nli_evaluator
@@ -187,6 +202,7 @@ class EvaluationRouter:
                 )
 
                 logger.info("Tier 2 NLI: label=%s, confidence=%.2f", nli_label, nli_confidence)
+                nli_result = {"label": nli_label, "confidence": nli_confidence}
 
                 tier2_threshold = 0.85
                 try:
@@ -203,9 +219,10 @@ class EvaluationRouter:
                             "verdict": "PASS",
                             "tier": "T2_NLI",
                             "confidence": nli_confidence,
+                            "gnn_plausibility_score": gnn_score,
                             "llm_tokens_used": 0,
                             "rule_results": serialized_rules,
-                            "nli_result": {"label": nli_label, "confidence": nli_confidence},
+                            "nli_result": nli_result,
                             "explanation": "NLI semantic entailment confirmed answer accuracy",
                             "stop_reason": "STOP-2: High-confidence NLI pass"
                         }
@@ -215,9 +232,10 @@ class EvaluationRouter:
                             "verdict": "FAIL",
                             "tier": "T2_NLI",
                             "confidence": nli_confidence,
+                            "gnn_plausibility_score": gnn_score,
                             "llm_tokens_used": 0,
                             "rule_results": serialized_rules,
-                            "nli_result": {"label": nli_label, "confidence": nli_confidence},
+                            "nli_result": nli_result,
                             "explanation": "NLI detected semantic contradiction with retrieved context",
                             "stop_reason": "STOP-2: High-confidence NLI fail"
                         }
@@ -267,8 +285,10 @@ class EvaluationRouter:
                     "verdict": verdict_map.get(critique.severity, "PASS"),
                     "tier": "T3_LLM_JUDGE",
                     "confidence": critique.confidence,
+                    "gnn_plausibility_score": gnn_score,
                     "llm_tokens_used": critique.tokens_used,
                     "rule_results": serialized_rules,
+                    "nli_result": nli_result,
                     "critic_result": {
                         "severity": critique.severity.value,
                         "confidence": critique.confidence,
@@ -287,8 +307,10 @@ class EvaluationRouter:
             "verdict": "NEEDS_HUMAN_REVIEW",
             "tier": "ESCALATED",
             "confidence": 0.3,
+            "gnn_plausibility_score": gnn_score,
             "llm_tokens_used": 0,
             "rule_results": serialized_rules,
+            "nli_result": nli_result,
             "explanation": "All automated tiers inconclusive; requires human review",
             "stop_reason": None
         }

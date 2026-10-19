@@ -33,6 +33,12 @@ from app.api.routes.query import (
 from app.engine import context_memory, graph_store, retrieval
 from app.retrieval.query_evidence_recorder import get_recorder as get_query_evidence_recorder
 from app.models.api import ChatRequest, ChatResponse, ChatTitleRequest, ChatTitleResponse, QueryRequest
+from app.core.logging import (
+    log_step_info,
+    log_step_warning,
+    log_step_error,
+    log_step_debug,
+)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 logger = logging.getLogger("app.api.chat")
@@ -57,7 +63,9 @@ async def _trigger_follow_up_detection(
         passive_feedback_detections_triggered.inc()
         start_t = time.perf_counter()
 
-        logger.info(
+        log_step_info(
+            logger,
+            "FOLLOW_UP_DETECTION",
             "Auto follow-up detection: session=%s, prev_resp=%s",
             session_id,
             previous_response_id,
@@ -76,12 +84,14 @@ async def _trigger_follow_up_detection(
 
         if result and result.get("is_correction"):
             passive_feedback_corrections_found.inc()
-            logger.info(
+            log_step_info(
+                logger,
+                "FOLLOW_UP_CORRECTION",
                 "Correction detected automatically via passive feedback: %s",
                 result.get("claim"),
             )
     except Exception as exc:
-        logger.warning("Passive follow-up detection failed: %s", exc)
+        log_step_warning(logger, "FOLLOW_UP_WARN", "Passive follow-up detection failed: %s", exc)
 
 
 async def _run_v2_chat(
@@ -110,6 +120,7 @@ async def _run_v2_chat(
     history = request.history
     session_id = request.session_id
     turn_index = len(history) // 2 + 1
+    log_step_info(logger, "V2_CHAT_START", "Routing chat turn to V2 orchestrator: '%s' (turn=%d, session_id=%s, mode=%s)", query, turn_index, session_id, request.mode)
 
     resp_obj = await container.orchestrator.answer(
         query=query,
@@ -408,6 +419,8 @@ async def _run_v2_chat(
         "sources": sources,
         "citations": citations_list,
         "metrics": metrics_list,
+        "graph_nodes": graph_nodes,
+        "graph_edges": graph_edges,
         # graph_highlight — full legacy-compatible dict; adapters read everything from here
         "graph_highlight": {
             "node_names": graph_nodes,
@@ -509,7 +522,7 @@ async def _run_v2_chat(
                 pending_notice.model_dump() if pending_notice else None
             )
 
-    return ChatResponse(
+    chat_response = ChatResponse(
         query=query,
         resolved_query=query,
         mode=request.mode,
@@ -525,6 +538,8 @@ async def _run_v2_chat(
         interaction_id=interaction_id,
         pending_feedback_notice=pending_notice,
     )
+    log_step_info(logger, "V2_CHAT_COMPLETE", "V2 chat turn completed for session %s (turn=%d, resp_id=%s)", session_id, turn_index, response_id)
+    return chat_response
 
 
 @router.post("/v2", response_model=ChatResponse)
@@ -550,6 +565,7 @@ async def run_chat(
 ) -> ChatResponse:
     """Multi-turn chat endpoint with QUERY_ENGINE routing."""
     engine = container.settings.query_engine.lower()
+    log_step_info(logger, "RUN_CHAT_DISPATCH", "Incoming /chat request: '%s' (session_id=%s, engine=%s)", request.query, request.session_id, engine)
 
     if engine == "v2":
         resp = await _run_v2_chat(request, container, current_user=current_user)
@@ -753,6 +769,18 @@ async def _chat_stream_generator(
                     complete_citations = event.get("citations") or (complete_answer.get("citations") if isinstance(complete_answer, dict) else []) or []
                     complete_nodes = event.get("graph_nodes") or []
                     complete_edges = event.get("graph_edges") or []
+                    if not complete_edges and complete_graph_facts:
+                        complete_edges = [
+                            {
+                                "s": f.get("subject") if isinstance(f, dict) else getattr(f, "subject", ""),
+                                "rel": f.get("predicate") if isinstance(f, dict) else getattr(f, "predicate", ""),
+                                "o": f.get("object") if isinstance(f, dict) else getattr(f, "object", ""),
+                                "conf": (f.get("properties", {}).get("confidence", 1.0) if isinstance(f, dict) else getattr(f, "properties", {}).get("confidence", 1.0)) if hasattr(f, "properties") or isinstance(f, dict) else 1.0
+                            }
+                            for f in complete_graph_facts
+                        ]
+                    if not complete_nodes and complete_edges:
+                        complete_nodes = sorted({e.get("s") for e in complete_edges if e.get("s")} | {e.get("o") for e in complete_edges if e.get("o")})
                     
                     # Provenance list for UI Document Sources
                     provenance_list = []
@@ -1274,5 +1302,15 @@ async def generate_title_endpoint(
     container: Container = Depends(get_container),
 ) -> ChatTitleResponse:
     """Fast, lightweight endpoint to generate a concise 2-5 word conversation title."""
+    if request.session_id and current_user:
+        from app.core.database import SessionLocal
+        from app.schemas.chat_sessions_table import ChatSession
+        with SessionLocal() as db:
+            existing_sess = db.query(ChatSession).filter_by(session_id=request.session_id).first()
+            if existing_sess and existing_sess.user_id != current_user.username:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Session {request.session_id} not found",
+                )
     title = await generate_chat_title(request.query)
     return ChatTitleResponse(title=title, session_id=request.session_id)

@@ -332,17 +332,32 @@ class GraphTraversal:
 
     async def _entity_lookup(self, intent: QueryIntent, entities: list[BaseEntity]):
         facts, paths, cyphers = [], [], []
-        lookup_entities = entities[:3]
+        lookup_names = []
+        for e in entities[:3]:
+            ename = getattr(e, "name", None)
+            if ename and ename not in lookup_names:
+                lookup_names.append(ename)
+        for m in (intent.entities_mentioned or [])[:3]:
+            if m and m not in lookup_names:
+                lookup_names.append(m)
+
+        if not lookup_names:
+            lookup_names = ["Mutual Funds"]
+
         entity_rows = await self._gather_rows(
-            [(cql.ENTITY_FACTS, {"entity_name": e.name}) for e in lookup_entities]
+            [(cql.ENTITY_FACTS, {"entity_name": name}) for name in lookup_names[:4]]
         )
-        for entity, rows in zip(lookup_entities, entity_rows):
-            cyphers.append("ENTITY_FACTS")
+        for name, rows in zip(lookup_names[:4], entity_rows):
+            if rows:
+                cyphers.append("ENTITY_FACTS")
             for row in rows:
-                if row["direction"] == "out":
-                    statement = f"{row['entity']} {row['rel_type']} {row['other']}"
+                ent_name = row.get("entity") or name
+                oth_name = row.get("other") or "Entity"
+                rel_type = row.get("rel_type") or "RELATED_TO"
+                if row.get("direction") == "out":
+                    statement = f"{ent_name} {rel_type} {oth_name}"
                 else:
-                    statement = f"{row['other']} {row['rel_type']} {row['entity']}"
+                    statement = f"{oth_name} {rel_type} {ent_name}"
                 props = {k: v for k, v in (row.get("props") or {}).items()
                          if k not in ("extraction_method", "confidence", "source_document_id")}
                 if props:
@@ -350,12 +365,42 @@ class GraphTraversal:
                 facts.append(GraphFact(
                     fact_id=str(uuid4()),
                     statement=statement,
-                    subject=row["entity"], predicate=row["rel_type"], object=row["other"],
+                    subject=ent_name, predicate=rel_type, object=oth_name,
                     properties=props,
-                    traversal_path=f"{entity.entity_type.value}→{row['rel_type']}→{row['other_type']}",
+                    traversal_path=f"{row.get('entity', 'Entity')}→{rel_type}→{row.get('other_type', 'Entity')}",
                 ))
             if rows:
-                paths.append(f"1-hop neighborhood of {entity.name} ({len(rows)} facts)")
+                paths.append(f"1-hop neighborhood of {name} ({len(rows)} facts)")
+
+        # Subgraph fallback if no exact entity rows found
+        if not facts:
+            try:
+                from app.engine import graph_store
+                q_ents = [{"text": n} for n in lookup_names]
+                sub = graph_store.get_subgraph_for_query_with_fallback(
+                    query=" ".join(lookup_names),
+                    limit=12,
+                    query_entities=q_ents
+                )
+                edges = sub.get("edges", [])
+                if edges:
+                    cyphers.append("SUBGRAPH_FALLBACK")
+                for e in edges:
+                    s_name = e.get("s") or "Entity"
+                    o_name = e.get("o") or "Target"
+                    rel_name = e.get("rel") or "CONNECTED_TO"
+                    facts.append(GraphFact(
+                        fact_id=str(uuid4()),
+                        statement=f"{s_name} {rel_name} {o_name}",
+                        subject=s_name, predicate=rel_name, object=o_name,
+                        properties={"confidence": e.get("conf", 1.0)},
+                        traversal_path=f"{e.get('s_label', 'Entity')}→{rel_name}→{e.get('o_label', 'Entity')}",
+                    ))
+                if edges:
+                    paths.append(f"Connected knowledge graph neighborhood ({len(edges)} facts)")
+            except Exception as f_exc:
+                logger.debug("Entity lookup subgraph fallback notice: %s", f_exc)
+
         return facts, paths, cyphers
 
     async def _noop(self, intent: QueryIntent, entities: list[BaseEntity]):

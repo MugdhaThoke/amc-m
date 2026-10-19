@@ -22,6 +22,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
+from app.monitoring.patch_metrics import get_patch_metrics  # GAP 2: Metrics
+
 logger = logging.getLogger("app.graph.correction_patch_layer")
 
 
@@ -40,6 +42,13 @@ class CorrectionPatch:
     approved: bool
     created_at: str
     expires_at: Optional[str] = None
+    
+    # NEW FIELDS for conflict resolution (GAP 1)
+    version: int = 1  # Monotonic version counter
+    supersedes_patch_id: Optional[str] = None  # Tracks patch lineage
+    superseded_by_patch_id: Optional[str] = None  # Bidirectional link
+    conflict_resolution_reason: Optional[str] = None  # Audit trail for auto-resolution
+    source_type: str = "user_feedback"  # "user_feedback" or "regulatory"
 
 
 class CorrectionPatchLayer:
@@ -82,8 +91,72 @@ class CorrectionPatchLayer:
         corrected_value: Any,
         confidence: float,
         provenance: Optional[Dict[str, Any]] = None,
-        approved: bool = False
-    ) -> str:
+        approved: bool = False,
+        source_type: str = "user_feedback",  # NEW: For conflict resolution
+    ) -> dict:  # Changed return type from str to dict (GAP 1)
+        """
+        Add or update a correction patch with conflict detection.
+        
+        Returns dict with keys: patch_id, conflict_detected, conflict_report, resolution, status
+        """
+        # Step 1: Detect conflicts (GAP 1)
+        try:
+            from amc_repair.conflict_resolver import get_conflict_resolver
+            conflict_resolver = get_conflict_resolver()
+            
+            new_patch_dict = {
+                "entity_id": entity_id,
+                "attribute": attribute,
+                "canonical_value": canonical_value,
+                "corrected_value": corrected_value,
+                "confidence": confidence,
+                "source_type": source_type,
+                "provenance": provenance or {},
+            }
+            
+            conflict = conflict_resolver.detect_conflict(self, new_patch_dict)
+            
+            # Step 2: Resolve conflict (if detected)
+            resolution = None
+            version = 1
+            supersedes_patch_id = None
+            conflict_resolution_reason = None
+            
+            if conflict:
+                import asyncio
+                resolution = asyncio.run(conflict_resolver.resolve_conflict(self, conflict))
+                
+                if resolution["resolution"] == "pending_human_review":
+                    logger.warning("❓ Conflict escalated to human review: %s", resolution["conflict_id"])
+                    return {
+                        "patch_id": None,
+                        "conflict_detected": True,
+                        "conflict_report": conflict,
+                        "resolution": resolution,
+                        "status": "pending_human_review"
+                    }
+                
+                if resolution["resolution"] == "rejected":
+                    logger.info("❌ New patch rejected due to conflict: %s", resolution["reason"])
+                    return {
+                        "patch_id": None,
+                        "conflict_detected": True,
+                        "conflict_report": conflict,
+                        "resolution": resolution,
+                        "status": "rejected"
+                    }
+                
+                # Auto-resolved: update versioning
+                version = resolution.get("new_version", 1)
+                supersedes_patch_id = resolution.get("superseded_patch_id")
+                conflict_resolution_reason = conflict.recommended_action
+                
+        except Exception as e:
+            logger.debug("Conflict detection disabled or error: %s", e)
+            conflict = None
+            resolution = None
+        
+        # Step 3: Create patch with versioning fields
         patch_id = f"patch_{uuid.uuid4().hex[:12]}"
         patch_key = self._make_key(entity_id, attribute)
 
@@ -100,7 +173,12 @@ class CorrectionPatchLayer:
             provenance=provenance or {},
             approved=approved,
             created_at=now.isoformat() + "Z",
-            expires_at=expires_at
+            expires_at=expires_at,
+            version=version,  # NEW
+            supersedes_patch_id=supersedes_patch_id,  # NEW
+            superseded_by_patch_id=None,  # NEW
+            conflict_resolution_reason=conflict_resolution_reason,  # NEW
+            source_type=source_type,  # NEW
         )
 
         patch_dict = asdict(patch)
@@ -113,14 +191,29 @@ class CorrectionPatchLayer:
                 if not approved:
                     self.redis.expire(patch_key, self.ttl_seconds)
                 written_to_redis = True
-                logger.info("Wrote patch %s to Redis key %s (approved=%s)", patch_id, patch_key, approved)
+                logger.info("✅ Wrote patch %s v%d to Redis key %s (approved=%s)", 
+                           patch_id, version, patch_key, approved)
             except Exception as exc:
                 logger.warning("Redis set failed, falling back to memory: %s", exc)
 
         with self._lock:
             self._mem_store[patch_key] = patch_dict
 
-        return patch_id
+        # GAP 2: Track patch confidence
+        metrics = get_patch_metrics()
+        metrics.record_patch_confidence(patch.confidence)
+        
+        # GAP 2: Track conflicts (if conflict resolver integrated)
+        if conflict:
+            metrics.record_patch_conflict(resolution["resolution"])
+
+        return {
+            "patch_id": patch_id,
+            "conflict_detected": conflict is not None,
+            "conflict_report": conflict,
+            "resolution": resolution,
+            "status": "created"
+        }
 
     def get_correction(self, entity_id: str, attribute: str) -> Optional[CorrectionPatch]:
         patch_key = self._make_key(entity_id, attribute)
@@ -189,6 +282,10 @@ class CorrectionPatchLayer:
                         del self._mem_store[k]
 
         return patches
+
+    def get_patches_for_entity(self, entity_id: str) -> List[CorrectionPatch]:
+        all_p = self.get_all_patches()
+        return [p for p in all_p if p.entity_id.strip().lower() == entity_id.strip().lower()]
 
     def get_all_pending(self) -> List[CorrectionPatch]:
         return [p for p in self.get_all_patches() if not p.approved]
@@ -267,6 +364,26 @@ class CorrectionPatchLayer:
                         "source": target_patch.provenance.get("source", "Feedback correction")
                     }
                 )
+                # Direct property mutation on node (Scheme/Fund)
+                neo4j_session.run(
+                    f"""
+                    MATCH (e) WHERE (e.dedup_key = $entity_id OR e.isin = $entity_id OR e.id = $entity_id OR e.name = $entity_id)
+                    SET e.{target_patch.attribute} = $new_value,
+                        e.{target_patch.attribute}_updated_at = datetime()
+                    """,
+                    parameters={
+                        "entity_id": target_patch.entity_id,
+                        "new_value": str(target_patch.corrected_value)
+                    }
+                )
+                # Cleanup virtual shadow patch overlay now that canonical node is mutated
+                neo4j_session.run(
+                    """
+                    MATCH (p:ShadowPatch {patch_id: $patch_id})
+                    DETACH DELETE p
+                    """,
+                    parameters={"patch_id": patch_id}
+                )
                 logger.info("Promoted patch %s to canonical Neo4j graph for %s.%s",
                             patch_id, target_patch.entity_id, target_patch.attribute)
             except Exception as exc:
@@ -288,7 +405,17 @@ class CorrectionPatchLayer:
         with self._lock:
             self._mem_store[patch_key] = updated_dict
 
-        logger.info("Patch %s promoted to permanent", patch_id)
+        # GAP 2: Track promotion
+        metrics = get_patch_metrics()
+        created_at = datetime.fromisoformat(target_patch.created_at.replace("Z", ""))
+        time_to_promote_seconds = (datetime.utcnow() - created_at).total_seconds()
+        metrics.record_patch_promotion(
+            entity_id=target_patch.entity_id,
+            attribute=target_patch.attribute,
+            time_to_promote_seconds=time_to_promote_seconds
+        )
+
+        logger.info("🎯 Patch %s promoted to permanent (v%d)", patch_id, target_patch.version)
         return True
 
     def delete_patch(self, patch_id: str) -> bool:
@@ -347,7 +474,14 @@ def get_correction_patch_layer() -> CorrectionPatchLayer:
                 settings = get_settings()
                 redis_host = getattr(settings, 'redis_host', 'localhost')
                 redis_port = getattr(settings, 'redis_port', 6379)
-                client = redis.Redis(host=redis_host, port=redis_port, db=0, decode_responses=True, socket_timeout=1.0)
+                client = redis.Redis(
+                    host=redis_host,
+                    port=redis_port,
+                    db=0,
+                    decode_responses=True,
+                    socket_connect_timeout=0.2,
+                    socket_timeout=0.2
+                )
                 client.ping()
                 redis_client = client
                 logger.info("Connected to Redis for CorrectionPatchLayer")

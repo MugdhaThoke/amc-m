@@ -38,6 +38,12 @@ from app.models.api import QueryRequest, QueryResponse, TraditionalResult
 from app.models.feedback import PendingFeedbackNotice
 from app.models.query import SourceAttribution, SynthesisOutput
 from app.schemas.response_feedback_table import ResponseFeedback
+from app.core.logging import (
+    log_step_info,
+    log_step_warning,
+    log_step_error,
+    log_step_debug,
+)
 
 logger = logging.getLogger("app.api.query")
 
@@ -231,6 +237,7 @@ async def _run_v2_orchestrator(
 ) -> QueryResponse:
     query = request.query
     mode = request.mode
+    log_step_info(logger, "V2_ROUTE_START", "Routing query to V2 orchestrator: '%s' (mode=%s, session_id=%s)", query, mode, request.session_id)
     resp_obj = await container.orchestrator.answer(
         query,
         top_k=request.top_k,
@@ -533,7 +540,60 @@ async def _run_v2_orchestrator(
     except Exception as exc:
         logger.warning("Pending feedback check in _run_v2_orchestrator failed: %s", exc)
 
-    return QueryResponse(
+    response_id = f"resp_{uuid.uuid4().hex[:12]}"
+    interaction_id = f"int_{uuid.uuid4().hex[:12]}"
+
+    # Audit evidence — ContextGraph turns with session_id
+    if mode in ("contextgraph", "both") and request.session_id:
+        user_id = (current_user.username if current_user else None) or request.actor_id or "system_user"
+        tenant_id = current_user.tenant_id if current_user else None
+        hybrid_data = {
+            "response_id": response_id,
+            "interaction_id": interaction_id,
+            "answer": {
+                **(synthesis.model_dump() if synthesis else {}),
+                "compliance_note": synthesis.compliance_note if synthesis else "",
+                "citations": citations_list,
+                "metrics": metrics_list,
+            },
+            "sources": sources,
+            "citations": citations_list,
+            "metrics": metrics_list,
+            "graph_highlight": {
+                "node_names": graph_nodes,
+                "relationships": graph_rels,
+                "entities": matched_entity_texts,
+                "labels": active_labels,
+                "edges": graph_edges,
+                "edges_used_in_prompt": graph_edges,
+                "entity_summary": entity_summary,
+                "query_type": query_type_str,
+                "telemetry_breakdown": telemetry_breakdown,
+                "provenance": provenance_list,
+                "metrics": metrics_list,
+                "cross_val_ledger": cross_val_ledger,
+            },
+            "latency_ms": int(trace.request_total_ms if trace else 0),
+            "telemetry_breakdown": telemetry_breakdown,
+            "trace": trace.model_dump() if trace else None,
+        }
+        try:
+            from app.retrieval.query_evidence_recorder import get_recorder as get_query_evidence_recorder
+            await asyncio.to_thread(
+                get_query_evidence_recorder().record_v2_contextgraph_turn,
+                session_id=request.session_id,
+                query_text=query,
+                hybrid=hybrid_data,
+                intent=intent,
+                trace=trace,
+                serving_engine="v2",
+                user_id=user_id,
+                tenant_id=tenant_id,
+            )
+        except Exception as qe_exc:
+            logger.warning("Query evidence recording failed in _run_v2_orchestrator: %s", qe_exc)
+
+    query_response = QueryResponse(
         query=query,
         mode=mode,
         intent=intent,
@@ -570,10 +630,12 @@ async def _run_v2_orchestrator(
         trace=trace,
         serving_engine="v2",
         corpus_version=container.settings.active_corpus_version,
-        response_id=f"resp_{uuid.uuid4().hex[:12]}",
-        interaction_id=f"int_{uuid.uuid4().hex[:12]}",
+        response_id=response_id,
+        interaction_id=interaction_id,
         pending_feedback_notice=pending_feedback_notice,
     )
+    log_step_info(logger, "V2_ROUTE_COMPLETE", "V2 orchestrator query returned response %s in %dms (passed_gate=%s)", response_id, int(trace.request_total_ms if trace else 0), trace.quality_gate_passed if trace else True)
+    return query_response
 
 
 @router.post("/v2", response_model=QueryResponse)
@@ -600,6 +662,7 @@ async def run_traditional(
     Scheduled for removal in Week 3 (RFC 8594 Sunset 2026-10-22).
     Clients should use POST /query with mode="traditional".
     """
+    log_step_info(logger, "RUN_TRADITIONAL_DISPATCH", "Incoming legacy /traditional request: '%s'", request.query)
     response.headers["Deprecation"] = "true"
     response.headers["Sunset"] = "2026-10-22"
     response.headers["Link"] = '</query>; rel="successor-version"'
@@ -620,7 +683,7 @@ async def run_traditional(
             actor_id=getattr(request, "actor_id", None),
         )
     except Exception as exc:
-        logger.warning("Pending feedback check in run_traditional failed: %s", exc)
+        log_step_warning(logger, "FEEDBACK_CHECK_WARN", "Pending feedback check in run_traditional failed: %s", exc)
 
     store = _get_store()
     result = await asyncio.to_thread(retrieval.traditional_rag, request.query, store)
@@ -641,6 +704,7 @@ async def run_contextgraph(
     Scheduled for removal in Week 3 (RFC 8594 Sunset 2026-10-22).
     Clients should use POST /query with mode="contextgraph".
     """
+    log_step_info(logger, "RUN_CONTEXTGRAPH_DISPATCH", "Incoming legacy /contextgraph request: '%s'", request.query)
     response.headers["Deprecation"] = "true"
     response.headers["Sunset"] = "2026-10-22"
     response.headers["Link"] = '</query>; rel="successor-version"'
@@ -661,7 +725,7 @@ async def run_contextgraph(
             actor_id=getattr(request, "actor_id", None),
         )
     except Exception as exc:
-        logger.warning("Pending feedback check in run_contextgraph failed: %s", exc)
+        log_step_warning(logger, "FEEDBACK_CHECK_WARN", "Pending feedback check in run_contextgraph failed: %s", exc)
 
     store = _get_store()
     result = await asyncio.to_thread(retrieval.hybrid_graphrag, request.query, store)
@@ -680,6 +744,7 @@ async def run_query(
 ) -> QueryResponse:
     """Production query endpoint with QUERY_ENGINE feature flag routing."""
     engine = container.settings.query_engine.lower()
+    log_step_info(logger, "RUN_QUERY_DISPATCH", "Incoming /query request: '%s' (mode=%s, engine=%s)", request.query, request.mode, engine)
 
     if engine == "v2":
         resp = await _run_v2_orchestrator(request, container)
@@ -742,6 +807,23 @@ async def run_query(
         resp.interaction_id = cg.interaction_id
         if request.mode == "contextgraph":
             resp.latency_ms = cg.latency_ms
+
+        if request.session_id:
+            try:
+                from app.retrieval.query_evidence_recorder import get_recorder as get_query_evidence_recorder
+                user_id = request.actor_id or "system_user"
+                await asyncio.to_thread(
+                    get_query_evidence_recorder().record_contextgraph_turn,
+                    session_id=request.session_id,
+                    query_text=request.query,
+                    result=ctx,
+                    hybrid=cg.model_dump(),
+                    serving_engine="legacy",
+                    user_id=user_id,
+                    tenant_id=None,
+                )
+            except Exception as exc:
+                logger.warning("Query evidence recording failed in run_query legacy: %s", exc)
 
     return resp
 

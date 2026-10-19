@@ -357,3 +357,26 @@ Registry mapping each QueryType to its TraversalStrategy.
 GraphTraversal.traverse() looks up this dict in Step 3.
 To tune retrieval behaviour: change the quota values here, not in retrieval code.
 """
+
+
+class OrchestratorResponse:
+    """Wrapper that supports both 4-tuple unpacking and direct attribute access including trace and metrics."""
+    def __init__(
+        self,
+        intent: Optional[QueryIntent],
+        retrieval: Optional[RetrievalResult],
+        context: Optional[AssembledContext],
+        synthesis: SynthesisOutput,
+        trace: Optional[QueryTrace] = None,
+        metrics: Optional[Any] = None,
+    ):
+        self.intent = intent
+        self.retrieval = retrieval
+        self.context = context
+        self.synthesis = synthesis
+        self.trace = trace
+        self.metrics = metrics
+
+    def __iter__(self):
+        return iter((self.intent, self.retrieval, self.context, self.synthesis))
+

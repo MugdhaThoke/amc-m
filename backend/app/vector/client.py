@@ -482,6 +482,65 @@ class VectorStore:
             chunks.append({"chunk_id": p["chunk_id"], "text": p.get("text", ""), "order": p.get("order", 0)})
         return sorted(chunks, key=lambda c: c["order"])
 
+    async def ingest_synthetic_patch_chunk(
+        self,
+        patch_id: str,
+        entity_id: str,
+        attribute: str,
+        value: Any,
+        source: str = "Regulatory Erratum",
+        context_snippet: Optional[str] = None,
+    ) -> str:
+        """
+        Option 3: Ingest an authoritative synthetic patch chunk into the FAISS vector index.
+        """
+        clean_attr = str(attribute).replace("_", " ").title()
+        doc_text = (
+            f"Official Regulatory Erratum and Verified Master Data: "
+            f"The {clean_attr} for {entity_id} is officially {value}. "
+            f"This verified filing supersedes all prior documents and prospectus excerpts."
+        )
+        doc = {
+            "chunk_id": f"synthetic_patch_{patch_id}",
+            "document_id": f"patch_{patch_id}",
+            "document_title": f"Verified Erratum: {entity_id} ({clean_attr})",
+            "source_filename": f"erratum_{entity_id.lower().replace(' ', '_')}.pdf",
+            "text": doc_text,
+            "page_start": 1,
+            "page_end": 1,
+            "metadata": {
+                "is_synthetic_patch": True,
+                "patch_id": patch_id,
+                "entity_id": entity_id,
+                "attribute": attribute,
+                "value": str(value),
+                "indexed_at": datetime.now(timezone.utc).isoformat(),
+            },
+            "taxonomy_paths": [],
+            "entity_ids": [entity_id],
+        }
+        res = await self.add_documents([doc])
+        logger.info("Ingested synthetic vector chunk for patch %s: %s.%s = %s", patch_id, entity_id, attribute, value)
+        return res[0] if res else f"synthetic_patch_{patch_id}"
+
+    async def evict_synthetic_patch_chunk(self, patch_id: str) -> bool:
+        """
+        Option 3: Evict synthetic patch chunk from vector store index.
+        """
+        target_chunk_id = f"synthetic_patch_{patch_id}"
+        async with self._lock:
+            found_key = None
+            for fid, payload in list(self._payloads.items()):
+                if payload.get("chunk_id") == target_chunk_id or (payload.get("metadata") or {}).get("patch_id") == patch_id:
+                    found_key = fid
+                    break
+            if found_key is not None:
+                del self._payloads[found_key]
+                await asyncio.to_thread(self._persist)
+                logger.info("Evicted synthetic vector chunk for patch %s", patch_id)
+                return True
+        return False
+
 
 class UserScopedVectorStore:
     """Vector store wrapper with user/tenant metadata filtering."""

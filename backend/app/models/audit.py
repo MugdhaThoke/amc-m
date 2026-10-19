@@ -180,3 +180,7 @@ class ChatSessionCreate(BaseModel):
     user_id: Optional[str] = None
     audit_id: Optional[str] = Field(default=None, description="Must match audit_metadata.audit_id if set")
 
+
+# Re-export GraphMutation schema for audit compatibility
+from app.schemas.graph_mutations_table import GraphMutation  # noqa: E402
+
