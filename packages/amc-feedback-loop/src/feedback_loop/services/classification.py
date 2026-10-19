@@ -1,4 +1,4 @@
-﻿"""
+"""
 Step 1  ClassificationService
 NER + Sentiment (VADER) + Intent detection.
 
@@ -19,9 +19,11 @@ from typing import Optional
 import structlog
 
 from feedback_loop.logging_config import get_pipeline_logger
+from feedback_loop.logging import get_feedback_logger, log_step_info, log_step_warning
 from feedback_loop.domain_models import ClassificationResult, FeedbackRecord
 
 logger = structlog.get_logger(__name__)
+step_logger_cls = get_feedback_logger("classification")
 
 # Intent keyword sets  lightweight, no model call required
 _CORRECTION_KEYWORDS = frozenset([
@@ -111,10 +113,16 @@ class ClassificationService:
         """
         
         # Initialize logger for this feedback item
+        log_step_info(
+            step_logger_cls,
+            "CLASSIFICATION_START",
+            "Classification starting for feedback_id=%s (text_length=%d)",
+            row.feedback_id,
+            len(row.notes or ""),
+        )
         if session_id and feedback_id:
             step_logger = get_pipeline_logger("classification", session_id, feedback_id)
             if step_logger:
-
                 step_logger.info("Classification starting", text_length=len(row.notes or ""))
         else:
             step_logger = None
@@ -158,9 +166,17 @@ class ClassificationService:
             result.entity_extracted = row.entity_name
             result.entity_type = row.entity_type
 
+        log_step_info(
+            step_logger_cls,
+            "CLASSIFICATION_COMPLETE",
+            "Classification complete for %s: intent=%s, entity=%s, sentiment=%.4f",
+            row.feedback_id,
+            result.intent,
+            result.entity_extracted,
+            result.sentiment_compound,
+        )
+
         if step_logger:
-
-
             step_logger.info(
                 "classification_complete",
                 feedback_id=row.feedback_id,

@@ -6,6 +6,9 @@ from typing import Any, Dict, List, Optional
 from .config import RepairConfig
 from .schemas import CorrectionPatch
 from .adapters.base import CacheAdapter
+from .logging import get_repair_logger, log_step_info, log_step_debug, log_step_warning
+
+logger = get_repair_logger("patch_layer")
 
 class CorrectionPatchLayer:
     def __init__(self, config: RepairConfig, cache_adapter: CacheAdapter):
@@ -43,6 +46,16 @@ class CorrectionPatchLayer:
             provenance=provenance or {},
         )
         await self.cache.set(self._key(patch_id), patch.to_dict())
+        log_step_info(
+            logger,
+            "PATCH_LAYER_CREATE",
+            "Stored patch %s in cache (entity=%s.%s, val=%s, approved=%s)",
+            patch_id,
+            entity_id,
+            attribute,
+            corrected_value,
+            auto_approve,
+        )
         return patch
 
     async def get_patch(self, patch_id: str) -> Optional[CorrectionPatch]:
@@ -54,13 +67,17 @@ class CorrectionPatchLayer:
     async def approve_patch(self, patch_id: str) -> bool:
         patch = await self.get_patch(patch_id)
         if not patch:
+            log_step_warning(logger, "PATCH_LAYER_APPROVE_MISS", "Patch %s not found for approval", patch_id)
             return False
         patch.approved = True
         await self.cache.set(self._key(patch_id), patch.to_dict())
+        log_step_info(logger, "PATCH_LAYER_APPROVED", "Patch %s approved in cache layer", patch_id)
         return True
 
     async def reject_patch(self, patch_id: str) -> bool:
-        return await self.cache.delete(self._key(patch_id))
+        res = await self.cache.delete(self._key(patch_id))
+        log_step_info(logger, "PATCH_LAYER_REJECTED", "Patch %s rejected (deleted=%s)", patch_id, res)
+        return res
 
     async def get_all_pending(self) -> List[CorrectionPatch]:
         keys = await self.cache.get_keys_by_pattern(f"{self._prefix}*")
@@ -74,11 +91,13 @@ class CorrectionPatchLayer:
     async def get_active_patches(self, entity_id: Optional[str] = None) -> List[CorrectionPatch]:
         keys = await self.cache.get_keys_by_pattern(f"{self._prefix}*")
         active: List[CorrectionPatch] = []
+        target = entity_id.strip().lower() if entity_id else ""
         for k in keys:
             data = await self.cache.get(k)
             if data and data.get("approved", False):
                 p = CorrectionPatch(**data)
-                if entity_id is None or p.entity_id == entity_id:
+                p_eid = (p.entity_id or "").strip().lower()
+                if not target or p_eid == target or target in p_eid or p_eid in target:
                     active.append(p)
         return active
 
@@ -86,10 +105,13 @@ class CorrectionPatchLayer:
         """Get all patches (active or for entity) for a given entity ID."""
         keys = await self.cache.get_keys_by_pattern(f"{self._prefix}*")
         matches: List[CorrectionPatch] = []
+        target = entity_id.strip().lower() if entity_id else ""
         for k in keys:
             data = await self.cache.get(k)
-            if data and data.get("entity_id") == entity_id:
-                matches.append(CorrectionPatch(**data))
+            if data:
+                e_id = (data.get("entity_id") or "").strip().lower()
+                if e_id and (e_id == target or target in e_id or e_id in target):
+                    matches.append(CorrectionPatch(**data))
         return matches
 
     async def apply_patches_to_context(
@@ -101,11 +123,17 @@ class CorrectionPatchLayer:
         Injects verified active correction patches into retrieved text context.
         """
         modified_context = retrieval_context
+        applied_count = 0
         for eid in entities:
             patches = await self.get_active_patches(entity_id=eid)
             for p in patches:
                 notice = f"\n[CORRECTION PATCH APPLIED: {p.attribute} = {p.corrected_value} (supersedes prior context)]\n"
                 modified_context = notice + modified_context
+                applied_count += 1
+        if applied_count > 0:
+            log_step_info(logger, "PATCH_INJECT_CONTEXT", "Injected %d active patches into context for entities %s", applied_count, entities)
+        else:
+            log_step_debug(logger, "PATCH_INJECT_CONTEXT", "No active patches found for entities %s", entities)
         return modified_context
 
     async def clear_all(self):

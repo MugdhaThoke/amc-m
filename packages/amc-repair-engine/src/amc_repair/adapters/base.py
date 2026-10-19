@@ -36,5 +36,13 @@ class GraphAdapter(ABC):
         pass
 
     @abstractmethod
+    async def create_shadow_patch(self, entity_id: str, patch_id: str, attribute: str, value: Any) -> bool:
+        pass
+
+    @abstractmethod
+    async def delete_shadow_patch(self, patch_id: str) -> bool:
+        pass
+
+    @abstractmethod
     async def close(self):
         pass

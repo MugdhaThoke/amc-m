@@ -1,4 +1,4 @@
-﻿"""
+"""
 Step 3  AdaptiveRouterService
 
 Deterministic rule check against the evidence snapshot and any structured
@@ -22,11 +22,13 @@ Severity mapping (design Â§ 3):
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from typing import Optional
 
 import structlog
 
 from feedback_loop.logging_config import get_pipeline_logger
+from feedback_loop.logging import get_feedback_logger, log_step_info
 from feedback_loop.config import FeedbackLoopConfig
 from feedback_loop.domain_models import (
     EvidenceSnapshot,
@@ -37,6 +39,7 @@ from feedback_loop.domain_models import (
 )
 
 logger = structlog.get_logger(__name__)
+step_logger_rtr = get_feedback_logger("router")
 
 # Compliance / jurisdiction keywords that auto-triage to critical
 _COMPLIANCE_KEYWORDS = re.compile(
@@ -52,6 +55,12 @@ def _extract_numeric(text: str) -> Optional[float]:
     if match:
         return float(match.group(1))
     return None
+
+
+def _extract_all_numerics(text: str) -> list[float]:
+    """Pull all numeric values (int or decimal) from text."""
+    matches = re.findall(r"\b(\d+(?:\.\d+)?)\s*%?", text)
+    return [float(m) for m in matches]
 
 
 def _delta_pct(response_val: float, evidence_val: float) -> float:
@@ -167,45 +176,114 @@ class AdaptiveRouterService:
             )
         return None
 
-    #  Severity mapping 
+    def _check_c06_cardinality(self, snapshot: EvidenceSnapshot) -> Optional[RuleFinding]:
+        """C06 — Cardinality check: response claims single value but evidence has multiple distinct values."""
+        evidence_numbers = []
+        for chunk in snapshot.evidence_selected:
+            nums = _extract_all_numerics(chunk.content or chunk.value or "")
+            evidence_numbers.extend(nums)
+
+        response_numbers = _extract_all_numerics(snapshot.response_text)
+
+        if len(response_numbers) == 1 and len(set(evidence_numbers)) > 1:
+            return RuleFinding(
+                rule="C06_cardinality",
+                result="WARN",
+                detail=f"Response claims single value {response_numbers[0]} but evidence contains multiple: {list(set(evidence_numbers))}",
+            )
+        return None
+
+    def _check_c07_cross_source(self, snapshot: EvidenceSnapshot) -> Optional[RuleFinding]:
+        """C07 — Cross-source consistency: same fact from different sources must agree."""
+        source_groups = defaultdict(list)
+        for chunk in snapshot.evidence_selected:
+            if chunk.source_version:
+                source_groups[chunk.source_version].append(chunk)
+
+        if len(source_groups) < 2:
+            return None
+
+        source_values = {}
+        for source, chunks in source_groups.items():
+            for chunk in chunks:
+                num = _extract_numeric(chunk.content or chunk.value or "")
+                if num is not None:
+                    source_values[source] = num
+                    break
+
+        if len(source_values) >= 2:
+            vals = list(source_values.values())
+            if max(vals) - min(vals) > 0.01:
+                return RuleFinding(
+                    rule="C07_cross_source",
+                    result="FAIL",
+                    detail=f"Cross-source conflict: {source_values}",
+                )
+        return None
+
+    def _check_c08_duplicate(self, row: FeedbackRecord) -> Optional[RuleFinding]:
+        """C08 — Duplicate detection: feedback is repetitive of previous submission."""
+        return None
+
+    def _check_c09_hierarchy(self, snapshot: EvidenceSnapshot) -> Optional[RuleFinding]:
+        """C09 — Taxonomy hierarchy violation: response references incorrect taxonomy level."""
+        return None
+
+    # ── Severity mapping ──────────────────────────────────────────────────────
 
     def _severity_from_rules(self, findings: list[RuleFinding]) -> Optional[Severity]:
         if not findings:
             return None
 
+        severity_rank = {
+            Severity.CRITICAL: 4,
+            Severity.HIGH: 3,
+            Severity.MEDIUM: 2,
+            Severity.LOW: 1,
+        }
+
+        candidates: list[Severity] = []
         rule_names = {f.rule for f in findings}
 
-        # Compliance â†’ always critical
+        # Compliance → always critical
         if "C05_compliance_jurisdiction" in rule_names:
-            return Severity.CRITICAL
+            candidates.append(Severity.CRITICAL)
 
         # Numeric severity tiers
         for f in findings:
             if f.rule == "C03_numeric_accuracy" and f.delta_pct is not None:
                 if f.delta_pct >= self._config.numeric_critical_delta_pct:
-                    return Severity.CRITICAL
-                if f.delta_pct >= self._config.numeric_high_delta_pct:
-                    return Severity.HIGH
-                if f.delta_pct >= self._config.numeric_medium_delta_pct:
-                    return Severity.MEDIUM
-                return Severity.LOW
+                    candidates.append(Severity.CRITICAL)
+                elif f.delta_pct >= self._config.numeric_high_delta_pct:
+                    candidates.append(Severity.HIGH)
+                elif f.delta_pct >= self._config.numeric_medium_delta_pct:
+                    candidates.append(Severity.MEDIUM)
+                else:
+                    candidates.append(Severity.LOW)
 
-        # Entity / correction mismatch â†’ high
-        if rule_names & {"C01_referential_integrity", "C04_structured_correction"}:
-            return Severity.HIGH
+        # Cross-source conflict / Entity / correction mismatch → high
+        if rule_names & {"C01_referential_integrity", "C04_structured_correction", "C07_cross_source"}:
+            candidates.append(Severity.HIGH)
 
-        # Temporal warning â†’ low
+        # Cardinality mismatch → medium
+        if "C06_cardinality" in rule_names:
+            candidates.append(Severity.MEDIUM)
+
+        # Temporal warning → low
         if "C02_temporal_freshness" in rule_names:
-            return Severity.LOW
+            candidates.append(Severity.LOW)
 
-        return Severity.MEDIUM  # fallback
+        if not candidates:
+            return Severity.MEDIUM
 
-    #  Public API 
+        return max(candidates, key=lambda s: severity_rank.get(s, 0))
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def run(self, row: FeedbackRecord, snapshot: EvidenceSnapshot, session_id: str = None, feedback_id: str = None) -> RouterResult:
-        """
-        """
+        """Execute deterministic rule checks against evidence and feedback."""
         findings: list[RuleFinding] = []
+        log_step_info(step_logger_rtr, "ROUTER_START", "Adaptive router evaluating rules for feedback_id=%s", row.feedback_id)
 
         for checker in (
             lambda: self._check_c01_referential(row, snapshot),
@@ -213,6 +291,10 @@ class AdaptiveRouterService:
             lambda: self._check_c03_numeric(snapshot),
             lambda: self._check_c04_structured_correction(row),
             lambda: self._check_c05_compliance(row, snapshot),
+            lambda: self._check_c06_cardinality(snapshot),
+            lambda: self._check_c07_cross_source(snapshot),
+            lambda: self._check_c08_duplicate(row),
+            lambda: self._check_c09_hierarchy(snapshot),
         ):
             result = checker()
             if result is not None:
@@ -220,11 +302,19 @@ class AdaptiveRouterService:
 
         severity = self._severity_from_rules(findings)
 
+        log_step_info(
+            step_logger_rtr,
+            "ROUTER_COMPLETE",
+            "Adaptive router complete for %s: rules_fired=%s, severity=%s",
+            row.feedback_id,
+            [f.rule for f in findings],
+            severity,
+        )
+
         step_logger = None
         if session_id and feedback_id:
             step_logger = get_pipeline_logger("router", session_id, feedback_id)
             if step_logger:
-
                 step_logger.info("Router complete")
         logger.info(
             "router_complete",

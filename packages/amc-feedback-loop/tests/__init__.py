@@ -1,1 +1,1 @@
-"""Tests for amc_feedback."""
+"""Tests for feedback_loop."""

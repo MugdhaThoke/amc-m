@@ -18,12 +18,15 @@ from datetime import datetime, timezone
 import uuid
 
 
+from feedback_loop.logging import ensure_log_directory
+
+
 def _ensure_log_dir(session_id: str, feedback_id: str) -> Path:
     """Create nested log directories: logs/session_<id>/<feedback_id>/"""
     log_base = Path("logs")
     session_dir = log_base / f"session_{session_id}"
     feedback_dir = session_dir / feedback_id
-    feedback_dir.mkdir(parents=True, exist_ok=True)
+    ensure_log_directory(feedback_dir)
     return feedback_dir
 
 

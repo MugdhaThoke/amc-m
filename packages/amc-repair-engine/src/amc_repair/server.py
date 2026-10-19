@@ -13,10 +13,18 @@ from pydantic import BaseModel
 from . import RepairEngine, RepairConfig
 from .adapters.cache import RedisAdapter, MemoryCacheAdapter, MemoryAdapter
 from .adapters.graph import Neo4jAdapter, MemoryGraphAdapter
+from .logging import (
+    setup_repair_logging,
+    get_repair_logger,
+    log_step_info,
+    log_step_warning,
+    log_step_error,
+    log_step_debug,
+)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("repair_service")
+setup_repair_logging()
+logger = get_repair_logger("server")
 
 # Create FastAPI app
 app = FastAPI(
@@ -85,10 +93,10 @@ def get_repair_engine() -> RepairEngine:
 # ── Request/Response Models ───────────────────────────────────
 
 class CreatePatchRequest(BaseModel):
-    entity_id: str
-    attribute: str
-    canonical_value: Any
-    corrected_value: Any
+    entity_id: Optional[str] = "unknown_entity"
+    attribute: Optional[str] = "general"
+    canonical_value: Any = None
+    corrected_value: Any = None
     confidence: float = 1.0
     provenance: Dict[str, Any] = {}
     approved: bool = False
@@ -119,10 +127,24 @@ async def health_check():
     }
 
 
+@app.on_event("startup")
+async def startup_event():
+    log_step_info(logger, "SERVER_STARTUP", "AMC Repair Engine Service initialized on port %s", os.getenv("PORT", "8002"))
+
+
 @app.post("/api/patches")
 async def create_patch(request: CreatePatchRequest):
     """Create a correction patch."""
     try:
+        log_step_info(
+            logger,
+            "PATCH_CREATE_REQUEST",
+            "Creating patch for entity=%s attr=%s corrected=%s (approved=%s)",
+            request.entity_id,
+            request.attribute,
+            request.corrected_value,
+            request.approved,
+        )
         engine = get_repair_engine()
         
         patch_id = await engine.add_correction(
@@ -135,7 +157,7 @@ async def create_patch(request: CreatePatchRequest):
             approved=request.approved
         )
         
-        logger.info(f"Patch created: {patch_id}")
+        log_step_info(logger, "PATCH_CREATED", "Patch %s created successfully for entity=%s", patch_id, request.entity_id)
         
         return {
             "status": "created",
@@ -143,7 +165,7 @@ async def create_patch(request: CreatePatchRequest):
         }
     
     except Exception as exc:
-        logger.error(f"Create patch error: {exc}")
+        log_step_error(logger, "PATCH_CREATE_ERROR", "Create patch error for entity=%s: %s", request.entity_id, exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -151,9 +173,11 @@ async def create_patch(request: CreatePatchRequest):
 async def get_pending_patches():
     """Get all pending (unapproved) patches."""
     try:
+        log_step_info(logger, "PATCH_PENDING_REQUEST", "Fetching all pending correction patches")
         engine = get_repair_engine()
         
         patches = await engine.get_pending_corrections()
+        log_step_info(logger, "PATCH_PENDING_RESPONSE", "Retrieved %d pending patches", len(patches))
         
         return {
             "total": len(patches),
@@ -174,7 +198,7 @@ async def get_pending_patches():
         }
     
     except Exception as exc:
-        logger.error(f"Get pending patches error: {exc}")
+        log_step_error(logger, "PATCH_PENDING_ERROR", "Get pending patches error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -182,6 +206,7 @@ async def get_pending_patches():
 async def get_patches_for_entities(entity_ids: str):
     """Get patches for specified entities (comma-separated IDs)."""
     try:
+        log_step_info(logger, "ENTITY_PATCHES_QUERY", "Querying patches for entities: %s", entity_ids)
         engine = get_repair_engine()
         
         entity_id_list = [eid.strip() for eid in entity_ids.split(",") if eid.strip()]
@@ -191,6 +216,14 @@ async def get_patches_for_entities(entity_ids: str):
             patches = await engine.patch_layer.get_patches_for_entity(entity_id)
             all_patches.extend(patches)
         
+        seen_ids = set()
+        unique_patches = []
+        for p in all_patches:
+            if p.patch_id not in seen_ids:
+                seen_ids.add(p.patch_id)
+                unique_patches.append(p)
+
+        log_step_info(logger, "ENTITY_PATCHES_RESPONSE", "Found %d unique patches for entities", len(unique_patches))
         return {
             "patches": [
                 {
@@ -202,27 +235,81 @@ async def get_patches_for_entities(entity_ids: str):
                     "confidence": p.confidence,
                     "approved": p.approved
                 }
-                for p in all_patches
+                for p in unique_patches
             ]
         }
     
     except Exception as exc:
-        logger.error(f"Get patches for entities error: {exc}")
+        log_step_error(logger, "ENTITY_PATCHES_ERROR", "Get patches for entities error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/patches/{patch_id}")
+async def get_patch_by_id(patch_id: str):
+    """Get details of a specific patch by ID."""
+    try:
+        log_step_info(logger, "PATCH_GET_REQUEST", "Fetching patch details for %s", patch_id)
+        engine = get_repair_engine()
+        
+        patch = await engine.patch_layer.get_patch(patch_id)
+        
+        if not patch:
+            log_step_warning(logger, "PATCH_GET_NOT_FOUND", "Patch %s not found", patch_id)
+            raise HTTPException(status_code=404, detail=f"Patch {patch_id} not found")
+        
+        log_step_info(logger, "PATCH_GET_SUCCESS", "Retrieved patch %s for entity %s", patch_id, patch.entity_id)
+        return {
+            "patch_id": patch.patch_id,
+            "entity_id": patch.entity_id,
+            "attribute": patch.attribute,
+            "canonical_value": patch.canonical_value if patch.canonical_value is not None else patch.original_value,
+            "corrected_value": patch.corrected_value,
+            "confidence": patch.confidence,
+            "provenance": patch.provenance,
+            "approved": patch.approved,
+            "created_at": patch.created_at,
+            "expires_at": patch.expires_at,
+            "version": getattr(patch, "version", 1),
+            "supersedes_patch_id": getattr(patch, "supersedes_patch_id", None),
+            "superseded_by_patch_id": getattr(patch, "superseded_by_patch_id", None),
+            "conflict_resolution_reason": getattr(patch, "conflict_resolution_reason", None),
+            "source_type": getattr(patch, "source_type", "user_feedback"),
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_step_error(logger, "PATCH_GET_ERROR", "Get patch by ID error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/api/patches/{patch_id}/approve")
 async def approve_patch(patch_id: str):
-    """Approve a correction patch."""
+    """Approve a correction patch and create shadow graph overlay."""
     try:
+        log_step_info(logger, "PATCH_APPROVE_REQUEST", "Approving patch %s", patch_id)
         engine = get_repair_engine()
         
+        patch = await engine.patch_layer.get_patch(patch_id)
         success = await engine.approve_correction(patch_id)
         
         if not success:
+            log_step_warning(logger, "PATCH_APPROVE_NOT_FOUND", "Patch %s not found for approval", patch_id)
             raise HTTPException(status_code=404, detail="Patch not found")
         
-        logger.info(f"Patch approved: {patch_id}")
+        if patch:
+            try:
+                await engine.graph.create_shadow_patch(
+                    entity_id=patch.entity_id,
+                    patch_id=patch.patch_id,
+                    attribute=patch.attribute,
+                    value=patch.corrected_value,
+                )
+                log_step_info(logger, "SHADOW_GRAPH_LINK", "Shadow graph linked for patch %s on %s", patch_id, patch.entity_id)
+            except Exception as shadow_exc:
+                log_step_debug(logger, "SHADOW_GRAPH_NOTICE", "Shadow patch link notice: %s", shadow_exc)
+
+        log_step_info(logger, "PATCH_APPROVED", "Patch approved successfully: %s", patch_id)
         
         return {
             "status": "approved",
@@ -232,22 +319,29 @@ async def approve_patch(patch_id: str):
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error(f"Approve patch error: {exc}")
+        log_step_error(logger, "PATCH_APPROVE_ERROR", "Approve patch error for %s: %s", patch_id, exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.post("/api/patches/{patch_id}/reject")
 async def reject_patch(patch_id: str, request: Optional[RejectPatchRequest] = None):
-    """Reject a correction patch."""
+    """Reject a correction patch and cleanup shadow graph overlay."""
     try:
+        log_step_info(logger, "PATCH_REJECT_REQUEST", "Rejecting patch %s", patch_id)
         engine = get_repair_engine()
         
+        try:
+            await engine.graph.delete_shadow_patch(patch_id)
+        except Exception:
+            pass
+
         success = await engine.reject_correction(patch_id)
         
         if not success:
+            log_step_warning(logger, "PATCH_REJECT_NOT_FOUND", "Patch %s not found for rejection", patch_id)
             raise HTTPException(status_code=404, detail="Patch not found")
         
-        logger.info(f"Patch rejected: {patch_id}")
+        log_step_info(logger, "PATCH_REJECTED", "Patch rejected successfully: %s", patch_id)
         
         return {
             "status": "rejected",
@@ -257,7 +351,7 @@ async def reject_patch(patch_id: str, request: Optional[RejectPatchRequest] = No
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error(f"Reject patch error: {exc}")
+        log_step_error(logger, "PATCH_REJECT_ERROR", "Reject patch error for %s: %s", patch_id, exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -265,6 +359,7 @@ async def reject_patch(patch_id: str, request: Optional[RejectPatchRequest] = No
 async def batch_approve(request: BatchApproveRequest):
     """Batch approve multiple patches."""
     try:
+        log_step_info(logger, "BATCH_APPROVE_REQUEST", "Batch approving %d patches", len(request.patch_ids))
         engine = get_repair_engine()
         
         results = {"approved": [], "failed": []}
@@ -276,12 +371,12 @@ async def batch_approve(request: BatchApproveRequest):
             else:
                 results["failed"].append(patch_id)
         
-        logger.info(f"Batch approve: {len(results['approved'])} approved")
+        log_step_info(logger, "BATCH_APPROVE_COMPLETE", "Batch approve: %d approved, %d failed", len(results["approved"]), len(results["failed"]))
         
         return results
     
     except Exception as exc:
-        logger.error(f"Batch approve error: {exc}")
+        log_step_error(logger, "BATCH_APPROVE_ERROR", "Batch approve error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -289,12 +384,22 @@ async def batch_approve(request: BatchApproveRequest):
 async def run_governance_batch(request: GovernanceBatchRequest = GovernanceBatchRequest()):
     """Run governance batch to promote approved corrections."""
     try:
+        log_step_info(logger, "GOVERNANCE_RUN_START", "Running governance batch promotion cycle...")
         engine = get_repair_engine()
-        
-        logger.info("Running governance batch...")
         
         report = await engine.run_governance_batch(
             auto_approve_threshold=request.auto_approve_threshold
+        )
+        
+        log_step_info(
+            logger,
+            "GOVERNANCE_RUN_COMPLETE",
+            "Governance batch complete: total=%d approved=%d promoted=%d rejected=%d review=%d",
+            report.total_evaluated,
+            report.approved,
+            report.deployed if report.deployed > 0 else report.promoted_to_graph,
+            report.rejected,
+            report.needs_review,
         )
         
         return {
@@ -308,7 +413,31 @@ async def run_governance_batch(request: GovernanceBatchRequest = GovernanceBatch
         }
     
     except Exception as exc:
-        logger.error(f"Governance batch error: {exc}")
+        log_step_error(logger, "GOVERNANCE_RUN_ERROR", "Governance batch error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/governance/promote/{patch_id}")
+async def promote_patch_to_graph(patch_id: str):
+    """Promote a specific patch directly to canonical Neo4j graph and retire shadow patch."""
+    try:
+        log_step_info(logger, "GOVERNANCE_PROMOTE_REQUEST", "Promoting patch %s directly to canonical graph", patch_id)
+        engine = get_repair_engine()
+        success = await engine.promote_patch(patch_id)
+        if not success:
+            log_step_warning(logger, "GOVERNANCE_PROMOTE_FAILED", "Patch %s not found or failed to promote", patch_id)
+            raise HTTPException(status_code=404, detail="Patch not found or failed to promote")
+        
+        log_step_info(logger, "GOVERNANCE_PROMOTED", "Patch %s canonically promoted to graph", patch_id)
+        return {
+            "status": "promoted",
+            "patch_id": patch_id,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log_step_error(logger, "GOVERNANCE_PROMOTE_ERROR", "Promote patch error for %s: %s", patch_id, exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -318,7 +447,7 @@ async def shutdown():
     global _repair_engine
     if _repair_engine:
         await _repair_engine.close()
-        logger.info("Repair engine closed")
+        log_step_info(logger, "SERVER_SHUTDOWN", "Repair engine closed successfully")
 
 
 if __name__ == "__main__":

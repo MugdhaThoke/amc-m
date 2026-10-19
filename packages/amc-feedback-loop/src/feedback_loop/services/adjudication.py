@@ -1,4 +1,4 @@
-﻿"""
+"""
 Step 4  AdjudicationService
 
 Multi-dimension root_cause classification.
@@ -37,6 +37,7 @@ from typing import Optional
 import structlog
 
 from feedback_loop.logging_config import get_pipeline_logger
+from feedback_loop.logging import get_feedback_logger, log_step_info
 from feedback_loop.domain_models import (
     AdjudicationResult,
     ClassificationResult,
@@ -48,6 +49,7 @@ from feedback_loop.domain_models import (
 )
 
 logger = structlog.get_logger(__name__)
+step_logger_adj = get_feedback_logger("adjudication")
 
 
 def _rule_fired(findings: list[RuleFinding], rule_prefix: str) -> bool:
@@ -85,6 +87,13 @@ class AdjudicationService:
         by the RecordBuilder after this call.
         """
         findings = router_result.rules_fired
+        log_step_info(
+            step_logger_adj,
+            "ADJUDICATION_START",
+            "Adjudication starting for %s (findings_count=%d)",
+            row.feedback_id,
+            len(findings),
+        )
 
         # Priority 1  compliance / jurisdiction violation
         if _rule_fired(findings, "C05_compliance"):
@@ -119,11 +128,19 @@ class AdjudicationService:
         # Priority 8  no signal of any kind
         else:
             root_cause = RootCause.FEEDBACK_INVALID
+
+        log_step_info(
+            step_logger_adj,
+            "ADJUDICATION_COMPLETE",
+            "Adjudication complete for %s: root_cause=%s",
+            row.feedback_id,
+            root_cause,
+        )
+
         step_logger = None
         if session_id and feedback_id:
             step_logger = get_pipeline_logger("adjudication", session_id, feedback_id)
         if step_logger:
-
             step_logger.info(f"Adjudication complete. Root cause {str(root_cause)}")
         logger.info(
             "adjudication_complete",

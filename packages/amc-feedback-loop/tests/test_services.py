@@ -161,3 +161,113 @@ def test_adjudication_service_priority():
     snapshot_empty = EvidenceSnapshot(response_id="r1", original_query="q", response_text="ans")
     res_retrieval = adj.run(row=row, snapshot=snapshot_empty, router_result=router_retrieval)
     assert res_retrieval.root_cause == RootCause.RETRIEVAL
+
+
+def test_diagnosis_and_repair_analyzer_services():
+    from feedback_loop.domain_models import StackLayer, RepairTarget
+    from feedback_loop.services.diagnosis import DiagnosisService
+    from feedback_loop.services.repair_analyzer import RepairAnalyzerService
+
+    diag_svc = DiagnosisService()
+    repair_svc = RepairAnalyzerService()
+
+    # Case 1: Knowledge root cause with C04 structured correction
+    snapshot = EvidenceSnapshot(
+        response_id="r_diag1",
+        original_query="What is the TER?",
+        response_text="The TER is 0.79%",
+    )
+    router_res = RouterResult(
+        rules_fired=[RuleFinding(rule="C04_structured_correction", result="FAIL")],
+        severity=Severity.HIGH,
+    )
+
+    diag = diag_svc.diagnose(
+        root_cause=RootCause.KNOWLEDGE,
+        router_result=router_res,
+        snapshot=snapshot,
+    )
+    assert diag.stack_layer == StackLayer.KNOWLEDGE
+    assert diag.confidence >= 0.85
+
+    analysis = repair_svc.analyze(
+        diagnosis=diag,
+        severity=router_res.severity,
+        root_cause=RootCause.KNOWLEDGE,
+        confidence=diag.confidence,
+    )
+    assert analysis.repair is True
+    assert analysis.repair_target == RepairTarget.GRAPH
+
+    # Case 2: Retrieval root cause
+    diag_ret = diag_svc.diagnose(
+        root_cause=RootCause.RETRIEVAL,
+        router_result=RouterResult(rules_fired=[], severity=Severity.HIGH),
+        snapshot=snapshot,
+    )
+    assert diag_ret.stack_layer == StackLayer.RETRIEVAL
+    analysis_ret = repair_svc.analyze(
+        diagnosis=diag_ret,
+        severity=Severity.HIGH,
+        root_cause=RootCause.RETRIEVAL,
+        confidence=diag_ret.confidence,
+    )
+    assert analysis_ret.repair is True
+    assert analysis_ret.repair_target == RepairTarget.VECTOR
+
+
+def test_router_c06_c07_rules():
+    config = FeedbackLoopConfig()
+    router = AdaptiveRouterService(config)
+
+    # C06: Cardinality check - 1 number in response, multiple in evidence
+    snap_c06 = EvidenceSnapshot(
+        response_id="r_c06",
+        original_query="What is the TER?",
+        response_text="The TER is 0.50%",
+        evidence_selected=[
+            EvidenceChunk(chunk_id="c1", content="TER was 0.50% in 2024"),
+            EvidenceChunk(chunk_id="c2", content="TER revised to 0.65% in 2025"),
+        ],
+    )
+    res_c06 = router.run(
+        row=FeedbackRecord(
+            feedback_id="fb_c06",
+            session_id="s1",
+            response_id="r_c06",
+            rating=RatingType.NEGATIVE,
+            feedback_type=FeedbackType.INACCURATE,
+            source=FeedbackSource.ACTIVE,
+            received_at=datetime.now(timezone.utc),
+        ),
+        snapshot=snap_c06,
+    )
+    fired_rules = [f.rule for f in res_c06.rules_fired]
+    assert "C06_cardinality" in fired_rules
+    assert res_c06.severity in (Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL)
+
+    # C07: Cross-source conflict - 2 chunks from different source versions with conflicting numbers
+    snap_c07 = EvidenceSnapshot(
+        response_id="r_c07",
+        original_query="What is the AUM?",
+        response_text="The AUM is 1000 Cr",
+        evidence_selected=[
+            EvidenceChunk(chunk_id="c1", source_version="factsheet_jan", content="AUM: 1000 Cr"),
+            EvidenceChunk(chunk_id="c2", source_version="factsheet_feb", content="AUM: 1200 Cr"),
+        ],
+    )
+    res_c07 = router.run(
+        row=FeedbackRecord(
+            feedback_id="fb_c07",
+            session_id="s1",
+            response_id="r_c07",
+            rating=RatingType.NEGATIVE,
+            feedback_type=FeedbackType.INACCURATE,
+            source=FeedbackSource.ACTIVE,
+            received_at=datetime.now(timezone.utc),
+        ),
+        snapshot=snap_c07,
+    )
+    fired_rules_c07 = [f.rule for f in res_c07.rules_fired]
+    assert "C07_cross_source" in fired_rules_c07
+    assert res_c07.severity == Severity.HIGH

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Step 2  EvidenceEnrichmentService
 
 Responsibilities (runs for BOTH active and passive rows):
@@ -21,6 +21,7 @@ from typing import Optional
 import structlog
 
 from feedback_loop.logging_config import get_pipeline_logger
+from feedback_loop.logging import get_feedback_logger, log_step_info, log_step_warning
 from feedback_loop.adapters.db import AbstractDatabaseAdapter
 from feedback_loop.adapters.evidence import AbstractEvidenceAdapter
 from feedback_loop.config import FeedbackLoopConfig
@@ -35,6 +36,7 @@ from feedback_loop.domain_models import (
 )
 
 logger = structlog.get_logger(__name__)
+step_logger_enr = get_feedback_logger("enrichment")
 
 
 def _cosine_similarity(text_a: str, text_b: str) -> float:
@@ -165,10 +167,16 @@ class EvidenceEnrichmentService:
         """
         """
         step_logger = None
+        log_step_info(
+            step_logger_enr,
+            "ENRICHMENT_START",
+            "Enrichment starting for response_id=%s (source=%s)",
+            row.response_id,
+            row.source,
+        )
         if session_id and feedback_id:
             step_logger = get_pipeline_logger("enrichment", session_id, feedback_id)
             if step_logger:
-
                 step_logger.info("Enrichment starting")
         
         # 1. Fetch frozen evidence snapshot
@@ -178,8 +186,14 @@ class EvidenceEnrichmentService:
         # 2. Deduplication  check for an existing open cluster
         existing = self._db.find_open_cluster(row.response_id, row.entity_name)
         if existing:
+            log_step_info(
+                step_logger_enr,
+                "DUPLICATE_DETECTED",
+                "Duplicate cluster detected for response_id=%s, entity=%s",
+                row.response_id,
+                row.entity_name,
+            )
             if step_logger:
-
                 step_logger.info("Duplicate detected", response_id=row.response_id)
             logger.info(
                 "duplicate_detected",
@@ -197,6 +211,12 @@ class EvidenceEnrichmentService:
 
         # 3. entry_route  active is always hitl
         if row.source == FeedbackSource.ACTIVE:
+            log_step_info(
+                step_logger_enr,
+                "ENRICHMENT_COMPLETE",
+                "Enrichment complete for response_id=%s: entry_route=hitl",
+                row.response_id,
+            )
             return EnrichmentResult(
                 evidence_snapshot_ref=evidence_snapshot_ref,
                 evidence_snapshot=snapshot,
@@ -212,15 +232,31 @@ class EvidenceEnrichmentService:
         )
         dissatisfaction = self._detect_dissatisfaction(snapshot, followups)
 
+        if dissatisfaction:
+            log_step_info(
+                step_logger_enr,
+                "DISSATISFACTION_DETECTED",
+                "Dissatisfaction signals detected for %s: %s (confidence=%.2f)",
+                row.response_id,
+                dissatisfaction.triggers,
+                dissatisfaction.confidence,
+            )
+
         entry_route = (
             EntryRoute.DISSATISFACTION_CONVERTED
             if dissatisfaction
             else EntryRoute.AUTOMATIC
         )
 
+        log_step_info(
+            step_logger_enr,
+            "ENRICHMENT_COMPLETE",
+            "Enrichment complete for response_id=%s: entry_route=%s",
+            row.response_id,
+            entry_route,
+        )
+
         if step_logger:
-
-
             step_logger.info("Enrichment complete", entry_route=str(entry_route))
         logger.info(
             "enrichment_complete",

@@ -5,7 +5,7 @@ import pytest
 import tempfile
 import os
 from pathlib import Path
-from amc_feedback import FeedbackLoop, FeedbackConfig, SQLiteAdapter, FollowUpDetectionRequest
+from feedback_loop import FeedbackLoop, FeedbackConfig, SQLiteAdapter, FollowUpDetectionRequest
 
 @pytest.fixture
 def temp_db():

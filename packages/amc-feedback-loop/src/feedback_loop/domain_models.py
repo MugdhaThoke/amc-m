@@ -1,4 +1,4 @@
-﻿"""
+"""
 domain_models.py
 ================
 Pydantic domain models used by the Human Feedback Loop pipeline.
@@ -97,6 +97,24 @@ class EntityType(str, Enum):
     OTHER     = "OTHER"
 
 
+class StackLayer(str, Enum):
+    KNOWLEDGE           = "knowledge"
+    RETRIEVAL           = "retrieval"
+    GRAPH               = "graph"
+    CONTEXT_ENGINEERING = "context_engineering"
+    MODEL               = "model"
+    GUARDRAIL           = "guardrail"
+    COMPLIANCE          = "compliance"
+    PRESENTATION        = "presentation"
+    FEEDBACK_INVALID    = "feedback_invalid"
+    UNKNOWN             = "unknown"
+
+
+class RepairTarget(str, Enum):
+    VECTOR = "vector"
+    GRAPH  = "graph"
+
+
 # ── Primary pipeline models ────────────────────────────────────────────────────
 
 class FeedbackRecord(BaseModel):
@@ -138,6 +156,10 @@ class UnifiedEvaluationRecord(BaseModel):
     lifecycle_status:       LifecycleStatus        = LifecycleStatus.OPEN
     dissatisfaction_evidence: Optional[dict]       = None
 
+    # Repair fields (Steps 5 & 6)
+    repair:                  bool                   = False
+    repair_target:           Optional[RepairTarget] = None
+
     # Set later by the Evaluation Layer
     deterministic_results:   Optional[dict]  = None
     gnn_plausibility_score:  Optional[float] = None
@@ -147,6 +169,18 @@ class UnifiedEvaluationRecord(BaseModel):
     adjudication_confidence: Optional[float] = None
 
     model_config = {"use_enum_values": True}
+
+
+class DiagnosisResult(BaseModel):
+    stack_layer: StackLayer
+    confidence:  float
+    evidence:    str
+
+
+class RepairAnalysis(BaseModel):
+    repair:        bool
+    repair_target: Optional[RepairTarget] = None
+    reason:        str                    = ""
 
 
 # ── Intermediate value objects ─────────────────────────────────────────────────

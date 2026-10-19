@@ -11,6 +11,17 @@ from .adapters.base import CacheAdapter, GraphAdapter
 from .adapters.cache import MemoryCacheAdapter, MemoryAdapter, RedisAdapter
 from .adapters.graph import MemoryGraphAdapter, Neo4jAdapter
 
+from .logging import (
+    setup_repair_logging,
+    get_repair_logger,
+    log_step,
+    log_step_info,
+    log_step_warning,
+    log_step_error,
+    log_step_debug,
+    ensure_log_directory,
+)
+
 __version__ = "0.1.0"
 __all__ = [
     "RepairConfig",
@@ -28,6 +39,14 @@ __all__ = [
     "RedisAdapter",
     "MemoryGraphAdapter",
     "Neo4jAdapter",
+    "setup_repair_logging",
+    "get_repair_logger",
+    "log_step",
+    "log_step_info",
+    "log_step_warning",
+    "log_step_error",
+    "log_step_debug",
+    "ensure_log_directory",
 ]
 
 
@@ -84,6 +103,24 @@ class RepairEngine:
     async def reject_correction(self, patch_id: str) -> bool:
         """Reject and remove a correction patch."""
         return await self.patch_layer.reject_patch(patch_id)
+
+    async def promote_patch(self, patch_id: str) -> bool:
+        """Promote a single patch directly to canonical graph and remove its shadow patch."""
+        patch = await self.patch_layer.get_patch(patch_id)
+        if not patch:
+            return False
+        await self.patch_layer.approve_patch(patch_id)
+        success = await self.graph.apply_entity_patch(
+            entity_id=patch.entity_id,
+            attribute=patch.attribute,
+            value=patch.corrected_value,
+        )
+        if success:
+            try:
+                await self.graph.delete_shadow_patch(patch_id)
+            except Exception:
+                pass
+        return success
 
     async def run_governance_batch(
         self,

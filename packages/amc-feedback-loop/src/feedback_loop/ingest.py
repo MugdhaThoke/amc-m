@@ -1,4 +1,4 @@
-﻿"""
+"""
 IngestService ” entry point for the Human Feedback Loop module.
 
 Two entry points:
@@ -18,8 +18,15 @@ from feedback_loop.adapters.evidence import AbstractEvidenceAdapter
 from feedback_loop.config import FeedbackLoopConfig
 from feedback_loop.domain_models import FeedbackSource, IngestionStatus
 from feedback_loop.orchestrator import RecordBuilder
+from feedback_loop.logging import (
+    get_feedback_logger,
+    log_step_info,
+    log_step_warning,
+    log_step_error,
+)
 
 logger = structlog.get_logger(__name__)
+step_logger = get_feedback_logger("ingest")
 
 
 class IngestService:
@@ -63,6 +70,14 @@ class IngestService:
             response_id=response_id,
             source=source,
         )
+        log_step_info(
+            step_logger,
+            "INGEST_START",
+            "Feedback ingest started: feedback_id=%s, response_id=%s, source=%s",
+            feedback_id,
+            response_id,
+            source,
+        )
         log.info("ingest_started")
 
         # Fetch the full row  adapter raises KeyError if not found
@@ -70,6 +85,14 @@ class IngestService:
 
         # Validate source matches (defensive; AMC owns the source field)
         if row.source != source:
+            log_step_warning(
+                step_logger,
+                "SOURCE_MISMATCH",
+                "Source mismatch for %s: db=%s, webhook=%s",
+                feedback_id,
+                row.source,
+                source,
+            )
             log.warning(
                 "source_mismatch",
                 db_source=row.source,
@@ -80,11 +103,24 @@ class IngestService:
             record = self._builder.build(row)
         except Exception as exc:
             self._db.update_ingestion_status(feedback_id, IngestionStatus.FAILED)
+            log_step_error(
+                step_logger,
+                "INGEST_BUILD_FAILED",
+                "Build failed for %s: %s",
+                feedback_id,
+                exc,
+            )
             log.error("build_failed", error=str(exc))
             raise
 
         if record is None:
             # Duplicate or already-processed ” not an error
+            log_step_info(
+                step_logger,
+                "INGEST_DUPLICATE_SKIPPED",
+                "Feedback %s skipped (duplicate or already processed)",
+                feedback_id,
+            )
             log.info("ingest_skipped_duplicate_or_existing")
             self._db.update_ingestion_status(feedback_id, IngestionStatus.SENT)
             return False
@@ -93,6 +129,15 @@ class IngestService:
         self._db.write_unified_record(record)
         self._db.update_ingestion_status(feedback_id, IngestionStatus.SENT)
 
+        log_step_info(
+            step_logger,
+            "INGEST_RECORD_PERSISTED",
+            "Unified evaluation record persisted for feedback_id=%s: entry_route=%s, root_cause=%s, severity=%s",
+            feedback_id,
+            record.entry_route,
+            record.root_cause,
+            record.severity,
+        )
         log.info(
             "ingest_complete",
             entry_route=record.entry_route,

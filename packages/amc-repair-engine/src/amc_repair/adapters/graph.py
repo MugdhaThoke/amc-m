@@ -21,6 +21,21 @@ class MemoryGraphAdapter(GraphAdapter):
     async def get_entity_property(self, entity_id: str, attribute: str) -> Optional[Any]:
         return self._graph.get(entity_id, {}).get(attribute)
 
+    async def create_shadow_patch(self, entity_id: str, patch_id: str, attribute: str, value: Any) -> bool:
+        if not hasattr(self, "_shadow_patches"):
+            self._shadow_patches = {}
+        self._shadow_patches[patch_id] = {
+            "entity_id": entity_id,
+            "attribute": attribute,
+            "value": value,
+        }
+        return True
+
+    async def delete_shadow_patch(self, patch_id: str) -> bool:
+        if hasattr(self, "_shadow_patches") and patch_id in self._shadow_patches:
+            del self._shadow_patches[patch_id]
+        return True
+
     async def close(self):
         self._graph.clear()
 
@@ -86,6 +101,48 @@ class Neo4jAdapter(GraphAdapter):
             except Exception as exc:
                 logger.debug("Neo4j property query error (%s), fallback used", exc)
         return await self._fallback.get_entity_property(entity_id, attribute)
+
+    async def create_shadow_patch(self, entity_id: str, patch_id: str, attribute: str, value: Any) -> bool:
+        await self._fallback.create_shadow_patch(entity_id, patch_id, attribute, value)
+        if self._driver:
+            try:
+                cypher = """
+                MATCH (e) WHERE e.isin = $entity_id OR e.id = $entity_id OR e.name = $entity_id
+                MERGE (p:ShadowPatch {patch_id: $patch_id})
+                SET p.name = $attribute + ' = ' + toString($value),
+                    p.attribute = $attribute,
+                    p.corrected_value = $value,
+                    p.status = 'approved',
+                    p.created_at = datetime()
+                MERGE (e)-[r:HAS_PATCH {attribute: $attribute}]->(p)
+                RETURN count(p) AS created
+                """
+                with self._driver.session(database=self.database) as session:
+                    res = session.run(cypher, entity_id=entity_id, patch_id=patch_id, attribute=attribute, value=str(value))
+                    record = res.single()
+                    return bool(record and record["created"] > 0)
+            except Exception as exc:
+                logger.debug("Neo4j create_shadow_patch notice (%s), fallback used", exc)
+                return True
+        return True
+
+    async def delete_shadow_patch(self, patch_id: str) -> bool:
+        await self._fallback.delete_shadow_patch(patch_id)
+        if self._driver:
+            try:
+                cypher = """
+                MATCH (p:ShadowPatch {patch_id: $patch_id})
+                DETACH DELETE p
+                RETURN count(p) AS deleted
+                """
+                with self._driver.session(database=self.database) as session:
+                    res = session.run(cypher, patch_id=patch_id)
+                    record = res.single()
+                    return bool(record and record["deleted"] > 0)
+            except Exception as exc:
+                logger.debug("Neo4j delete_shadow_patch notice (%s), fallback used", exc)
+                return True
+        return True
 
     async def close(self):
         if self._driver:
