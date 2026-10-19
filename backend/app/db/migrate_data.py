@@ -541,103 +541,36 @@ def populate_chat_sessions_and_query_evidence(db: Session) -> tuple[int, int]:
 
 
 def populate_response_feedback(db: Session) -> int:
-    """Populate baseline feedback records into data.db (single source of truth).
+    """Ensure clean runtime state for response_feedback.
     
-    Note: feedback.db has been deprecated. All feedback is now written directly 
-    to data.db via the API endpoints. This function seeds baseline feedback for
-    demo/testing purposes only.
+    Operational feedback records are generated dynamically in real-time from
+    live user submissions and passive detection timers. Seed/demo records are
+    purged to prevent orphan retry loops and database pollution.
     """
-    count = 0
-    default_audit_id = "audit_20260901_123456"
-
-    # Seed baseline feedback if empty
-    seed_feedback = [
-        {
-            "feedback_id": "fb_seed_001",
-            "response_id": "resp_seed_baseline_001",
-            "interaction_id": "int_4d5f72d3-a66a-4a89-b1e2-39e0de73e7fe",
-            "session_id": "4d5f72d3-a66a-4a89-b1e2-39e0de73e7fe",
-            "turn_number": 1,
-            "query_text": "Can you give me the characteristics of the liquid fund",
-            "actor_id": "sarah_compliance_lead",
-            "actor_role": "Compliance & Regulatory Officer",
-            "selected_categories": ["F01", "F03"],
-            "feedback_text": "Confirmed liquid fund residual maturity is capped at 91 days.",
-            "answer_relevance_score": 5,
-            "source_quality_score": 4,
-            "completeness_score": 5,
-            "automated_category": "compliance",
-            "automated_confidence": 0.92,
-            "audit_id": default_audit_id,
-        }
-    ]
-
-    for fb in seed_feedback:
-        existing = db.query(ResponseFeedback).filter(
-            (ResponseFeedback.feedback_id == fb["feedback_id"])
-            | ((ResponseFeedback.response_id == fb["response_id"]) & (ResponseFeedback.actor_id == fb["actor_id"]))
-        ).first()
-        if not existing:
-            if not db.query(ChatSession).filter_by(session_id=fb["session_id"]).first():
-                try:
-                    db.add(ChatSession(
-                        session_id=fb["session_id"],
-                        user_id=fb.get("actor_id") or "system_migration",
-                        tenant_id=None,
-                        created_at=_now(),
-                        updated_at=_now(),
-                        audit_id=default_audit_id,
-                    ))
-                    db.commit()
-                except Exception as sess_err:
-                    logger.warning("Could not add parent ChatSession for feedback: %s", sess_err)
-                    db.rollback()
-            try:
-                db.add(ResponseFeedback(**fb))
-                db.commit()
-                count += 1
-            except Exception as e:
-                logger.warning("Could not add baseline feedback row: %s", e)
-                db.rollback()
-
-    logger.info("Populated %d baseline response_feedback records into data.db", count)
-    return count
+    # Clean up any legacy demo seeds that might exist from early prototyping
+    legacy_ids = ["fb_seed_001", "fb_demo_001"]
+    deleted = db.query(ResponseFeedback).filter(ResponseFeedback.feedback_id.in_(legacy_ids)).delete(synchronize_session=False)
+    if deleted:
+        db.commit()
+        logger.info("Purged %d legacy demo seed feedback records from data.db", deleted)
+    return 0
 
 
 def populate_unified_evaluation_records(db: Session) -> int:
-    """Populate unified_evaluation_records linking feedback and query evidence."""
-    count = 0
-    records = [
-        {
-            "session_id": "4d5f72d3-a66a-4a89-b1e2-39e0de73e7fe",
-            "response_id": "resp_0aadfe67d35b",
-            "entry_route": "hitl",
-            "feedback_ref": "fb_seed_001",
-            "evidence_snapshot_ref": "resp_0aadfe67d35b",
-            "root_cause": "compliance",
-            "severity": "medium",
-            "lifecycle_status": "resolved",
-            "repair": False,
-            "repair_target": None,
-            "adjudication_verdict": "valid",
-            "adjudication_confidence": 0.94,
-        }
-    ]
-
-    for rec in records:
-        # Check evidence exists
-        if not db.query(QueryEvidence).filter_by(response_id=rec["evidence_snapshot_ref"]).first():
-            continue
-        existing = db.query(UnifiedEvaluationRecord).filter_by(
-            session_id=rec["session_id"], response_id=rec["response_id"]
-        ).first()
-        if not existing:
-            db.add(UnifiedEvaluationRecord(**rec))
-            count += 1
-
-    db.commit()
-    logger.info("Populated %d unified_evaluation_records into data.db", count)
-    return count
+    """Ensure clean runtime state for unified_evaluation_records.
+    
+    Unified evaluation records are created dynamically in real-time by the
+    feedback loop and repair engine pipeline upon adjudication against live QueryEvidence.
+    """
+    # Clean up any legacy demo evaluation records
+    deleted = db.query(UnifiedEvaluationRecord).filter(
+        (UnifiedEvaluationRecord.feedback_ref == "fb_seed_001") |
+        (UnifiedEvaluationRecord.response_id == "resp_seed_baseline_001")
+    ).delete(synchronize_session=False)
+    if deleted:
+        db.commit()
+        logger.info("Purged %d legacy demo unified evaluation records from data.db", deleted)
+    return 0
 
 
 def populate_data_db() -> Dict[str, Any]:

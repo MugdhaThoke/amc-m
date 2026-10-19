@@ -45,13 +45,40 @@ All project documentation is organized under the [`Docs/`](./Docs/README.md) fol
 
 ## 🚀 Running the Platform
 
-### Local Development (Windows)
+### 1. Environment Setup
+Copy the environment template to `.env` and set your API keys (e.g., `GROQ_API_KEY`):
+```cmd
+copy .env.example .env
+```
+
+### 2. Frontend (React 19 + Vite 8)
+Install dependencies and start the dev server at [http://localhost:5173](http://localhost:5173):
+```cmd
+npm install
+npm run dev
+```
+*Or use the quick launcher:* `run_frontend.bat`
+
+### 3. Backend (FastAPI + Neo4j)
+Install Python dependencies and start the API server at [http://localhost:8000](http://localhost:8000):
+```cmd
+pip install -r requirements.txt
+scripts\start_backend.bat
+```
+*(Swagger UI is available at `http://localhost:8000/docs`)*
+
+### 4. Full Portable Launcher (Windows)
+Runs Python environment checks, Neo4j, Backend API, and application services:
 ```cmd
 run_project.bat
 ```
 
-### Backend Tests
+### 5. Running Tests
 ```cmd
+# Frontend unit tests
+npm run test:frontend
+
+# Backend pytest suite
 cd backend
 pytest
 ```
