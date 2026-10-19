@@ -27,7 +27,7 @@ import {
   loginUser as apiLoginUser,
   logoutUser as apiLogoutUser,
 } from "../services/api";
-import { hasUserMessage } from "../utils/chatSessionUtils";
+import { hasUserMessage, getUserChatSessionsKey, getUserActiveSessionIdKey, loadUserChatSessions } from "../utils/chatSessionUtils";
 import { generateTraditionalResult, generateHybridResult } from "../data/mockEngine";
 
 const AppStateContext = createContext(null);
@@ -76,6 +76,7 @@ function uuid() {
     return v.toString(16);
   });
 }
+
 
 // ── Initial Mock Data ────────────────────────────────────────────────────────
 const INITIAL_INDEXING_TASKS = [
@@ -172,11 +173,14 @@ export function AppStateProvider({ children }) {
     setChatSessionsState({});
     const freshId = uuid();
     setChatSessionIdState(freshId);
+    setChatQuery("");
+    setChatError(null);
+    setIsChatLoading(false);
     try {
       sessionStorage.removeItem(STORAGE_KEYS.AUTH_SESSION);
       localStorage.removeItem(STORAGE_KEYS.AUTH_SESSION);
-      localStorage.removeItem(STORAGE_KEYS.CHAT_SESSIONS);
-      localStorage.removeItem(STORAGE_KEYS.ACTIVE_SESSION_ID);
+      // NOTE: User-specific chat sessions remain persistently stored in localStorage
+      // under getUserChatSessionsKey(username) and in the backend. They are NOT deleted on logout.
     } catch {}
   }, []);
 
@@ -258,14 +262,23 @@ export function AppStateProvider({ children }) {
 
         setActiveUsername(backendUser.username);
 
-        // Reset chat sessions state and assign fresh session ID for newly authenticated user
+        // Load the authenticated user's persistent chat sessions from localStorage
+        const userSavedSessions = loadUserChatSessions(backendUser.username);
+        setChatSessionsState(userSavedSessions);
+
+        // Automatically initialize a new, empty chat session instead of reopening or continuing the most recent conversation
         const freshSessionId = uuid();
         setChatSessionIdState(freshSessionId);
-        setChatSessionsState({});
-        try {
-          localStorage.removeItem(STORAGE_KEYS.CHAT_SESSIONS);
-          localStorage.removeItem(STORAGE_KEYS.ACTIVE_SESSION_ID);
-        } catch {}
+        safeStorageSet(getUserActiveSessionIdKey(backendUser.username), freshSessionId);
+        isLoginPendingNewChatRef.current = true;
+
+        setChatQuery("");
+        setChatError(null);
+        setIsChatLoading(false);
+        setActiveTabState(0);
+        safeStorageSet(STORAGE_KEYS.ACTIVE_TAB, 0);
+        setActivePageState("app");
+        safeStorageSet(STORAGE_KEYS.ACTIVE_PAGE, "app");
 
         setUsersState((prev) => {
           const profile = {
@@ -422,23 +435,34 @@ export function AppStateProvider({ children }) {
 
   // ── 3. Chat State (Multi-Session & Multi-Turn) ─────────────────────────────
   const [chatSessions, setChatSessionsState] = useState(() => {
-    const saved = safeStorageGet(STORAGE_KEYS.CHAT_SESSIONS, {});
-    const cleaned = {};
-    for (const [id, s] of Object.entries(saved || {})) {
-      if (hasUserMessage(s)) {
-        cleaned[id] = s;
-      }
-    }
-    // Clean out any stale empty sessions permanently from local storage
-    if (Object.keys(cleaned).length !== Object.keys(saved || {}).length) {
-      safeStorageSet(STORAGE_KEYS.CHAT_SESSIONS, cleaned);
-    }
-    return cleaned;
+    let currentAuth = null;
+    try {
+      const raw = sessionStorage.getItem(STORAGE_KEYS.AUTH_SESSION) || localStorage.getItem(STORAGE_KEYS.AUTH_SESSION);
+      if (raw) currentAuth = JSON.parse(raw);
+    } catch {}
+
+    const username = currentAuth?.isAuthenticated ? currentAuth.authedUsername : null;
+    if (!username) return {};
+    return loadUserChatSessions(username);
   });
 
   const [chatSessionId, setChatSessionIdState] = useState(() => {
-    const saved = safeStorageGet(STORAGE_KEYS.ACTIVE_SESSION_ID, null);
-    return saved || uuid();
+    // If opening a fresh browser window/tab, always start with a new chat session
+    let isSameWindowSession = false;
+    let currentAuth = null;
+    try {
+      const raw = sessionStorage.getItem(STORAGE_KEYS.AUTH_SESSION);
+      if (raw) {
+        currentAuth = JSON.parse(raw);
+        isSameWindowSession = Boolean(currentAuth?.isAuthenticated);
+      }
+    } catch {}
+
+    if (isSameWindowSession && currentAuth?.authedUsername) {
+      const saved = safeStorageGet(getUserActiveSessionIdKey(currentAuth.authedUsername), null);
+      if (saved) return saved;
+    }
+    return uuid();
   });
 
   const [chatQuery, setChatQuery] = useState("");
@@ -446,6 +470,11 @@ export function AppStateProvider({ children }) {
   const [chatError, setChatError] = useState(null);
   const [animatingSessionId, setAnimatingSessionId] = useState(null);
   const titleAnimTimerRef = useRef(null);
+  const isLoginPendingNewChatRef = useRef(false);
+  const chatSessionsRef = useRef(chatSessions);
+  useEffect(() => {
+    chatSessionsRef.current = chatSessions;
+  }, [chatSessions]);
 
   useEffect(() => {
     return () => {
@@ -458,15 +487,19 @@ export function AppStateProvider({ children }) {
   const setChatSessions = useCallback((updater) => {
     setChatSessionsState((prev) => {
       const next = typeof updater === "function" ? updater(prev) : updater;
-      safeStorageSet(STORAGE_KEYS.CHAT_SESSIONS, next);
+      if (authedUsername) {
+        safeStorageSet(getUserChatSessionsKey(authedUsername), next);
+      }
       return next;
     });
-  }, []);
+  }, [authedUsername]);
 
   const setChatSessionId = useCallback((id) => {
     setChatSessionIdState(id);
-    safeStorageSet(STORAGE_KEYS.ACTIVE_SESSION_ID, id);
-  }, []);
+    if (authedUsername) {
+      safeStorageSet(getUserActiveSessionIdKey(authedUsername), id);
+    }
+  }, [authedUsername]);
 
   // Backend persistence helper with automatic conflict re-keying
   const saveSessionToBackend = useCallback(async (sessionId, sessionData) => {
@@ -489,55 +522,88 @@ export function AppStateProvider({ children }) {
           const data = next[sessionId] || sessionData;
           delete next[sessionId];
           next[resp.session_id] = { ...data, id: resp.session_id };
-          safeStorageSet(STORAGE_KEYS.CHAT_SESSIONS, next);
+          if (authedUsername) {
+            safeStorageSet(getUserChatSessionsKey(authedUsername), next);
+          }
           return next;
         });
         setChatSessionIdState(resp.session_id);
-        safeStorageSet(STORAGE_KEYS.ACTIVE_SESSION_ID, resp.session_id);
+        if (authedUsername) {
+          safeStorageSet(getUserActiveSessionIdKey(authedUsername), resp.session_id);
+        }
       }
     } catch (err) {
       console.warn(`Failed to persist session ${sessionId} to backend:`, err);
     }
-  }, []);
+  }, [authedUsername]);
 
   // Synchronize chat sessions with backend on mount or when user changes
   useEffect(() => {
     let isCancelled = false;
     async function syncBackendSessions() {
-      if (!isAuthenticated || !authToken) return;
+      if (!isAuthenticated || !authToken || !authedUsername) return;
       try {
         const backendSessions = await apiFetchSessions();
         if (isCancelled || !Array.isArray(backendSessions)) return;
 
         const validIds = new Set(backendSessions.map((bs) => bs.session_id));
         setChatSessionsState((prev) => {
-          const next = {};
-          // Only populate sessions that belong to the current authenticated user
+          const next = { ...prev };
+          // Merge sessions from backend belonging to this authenticated user
           for (const bs of backendSessions) {
             const sid = bs.session_id;
             if (!sid) continue;
-            next[sid] = prev[sid] || {
-              id: sid,
-              title: bs.title || bs.preview || "Conversation",
-              isTitleGenerated: Boolean(bs.title && bs.title !== bs.preview),
-              history: [],
-              createdAt: bs.modified_time ? bs.modified_time * 1000 : Date.now(),
-              updatedAt: bs.modified_time ? bs.modified_time * 1000 : Date.now(),
-              _needsFetch: true,
-            };
+            const createdAtMs = bs.created_at ? Date.parse(bs.created_at) : (bs.modified_time ? bs.modified_time * 1000 : Date.now());
+            const updatedAtMs = bs.updated_at ? Date.parse(bs.updated_at) : (bs.modified_time ? bs.modified_time * 1000 : Date.now());
+
+            if (!next[sid]) {
+              next[sid] = {
+                id: sid,
+                title: bs.title || bs.preview || "Conversation",
+                isTitleGenerated: Boolean(bs.title && bs.title !== bs.preview),
+                turn_count: bs.turn_count || 1,
+                history: [],
+                createdAt: createdAtMs,
+                updatedAt: updatedAtMs,
+                _needsFetch: true,
+              };
+            } else {
+              // Update metadata if needed
+              if (bs.title && (!next[sid].title || next[sid].title === "New Conversation" || !next[sid].isTitleGenerated)) {
+                next[sid].title = bs.title;
+                next[sid].isTitleGenerated = true;
+              }
+              if (bs.turn_count && !next[sid].turn_count) {
+                next[sid].turn_count = bs.turn_count;
+              }
+            }
           }
-          safeStorageSet(STORAGE_KEYS.CHAT_SESSIONS, next);
+          safeStorageSet(getUserChatSessionsKey(authedUsername), next);
           return next;
         });
 
-        // Ensure active session belongs to this user; if not, point to their session or allocate a fresh uuid
+        // Ensure active session belongs to this user; always start with new chat on login, never existing recent chat
         setChatSessionIdState((currId) => {
-          if (!currId || !validIds.has(currId)) {
-            const chosen = backendSessions.length > 0 ? backendSessions[0].session_id : uuid();
-            safeStorageSet(STORAGE_KEYS.ACTIVE_SESSION_ID, chosen);
-            return chosen;
+          if (isLoginPendingNewChatRef.current) {
+            isLoginPendingNewChatRef.current = false;
+            const freshId =
+              currId && !validIds.has(currId) && (!chatSessionsRef.current[currId] || !hasUserMessage(chatSessionsRef.current[currId]))
+                ? currId
+                : uuid();
+            safeStorageSet(getUserActiveSessionIdKey(authedUsername), freshId);
+            return freshId;
           }
-          return currId;
+
+          if (currId && validIds.has(currId)) {
+            return currId;
+          }
+          if (currId && (!chatSessionsRef.current[currId] || !hasUserMessage(chatSessionsRef.current[currId]))) {
+            safeStorageSet(getUserActiveSessionIdKey(authedUsername), currId);
+            return currId;
+          }
+          const freshId = uuid();
+          safeStorageSet(getUserActiveSessionIdKey(authedUsername), freshId);
+          return freshId;
         });
       } catch (err) {
         console.warn("Could not sync chat sessions from backend:", err);
@@ -551,7 +617,7 @@ export function AppStateProvider({ children }) {
 
   // Fetch full history if the active session was loaded from backend metadata and needs history
   useEffect(() => {
-    if (!isAuthenticated || !authToken) return;
+    if (!isAuthenticated || !authToken || !authedUsername) return;
     if (chatSessions[chatSessionId]?._needsFetch) {
       apiFetchSessionHistory(chatSessionId)
         .then((data) => {
@@ -567,14 +633,14 @@ export function AppStateProvider({ children }) {
                   _needsFetch: false,
                 },
               };
-              safeStorageSet(STORAGE_KEYS.CHAT_SESSIONS, next);
+              safeStorageSet(getUserChatSessionsKey(authedUsername), next);
               return next;
             });
           }
         })
         .catch((err) => console.warn("Could not load session history for active session:", err));
     }
-  }, [chatSessionId, chatSessions, isAuthenticated, authToken]);
+  }, [chatSessionId, chatSessions, isAuthenticated, authToken, authedUsername]);
 
   const getChatHistory = useCallback(
     (id = chatSessionId) => {
@@ -785,8 +851,10 @@ export function AppStateProvider({ children }) {
     setChatSessions({});
     setChatSessionId(freshId);
     setChatQuery("");
-    safeStorageSet(STORAGE_KEYS.CHAT_SESSIONS, {});
-    safeStorageSet(STORAGE_KEYS.ACTIVE_SESSION_ID, freshId);
+    if (authedUsername) {
+      safeStorageSet(getUserChatSessionsKey(authedUsername), {});
+      safeStorageSet(getUserActiveSessionIdKey(authedUsername), freshId);
+    }
     for (const id of existingIds) {
       try {
         await apiDeleteSession(id);
@@ -794,7 +862,7 @@ export function AppStateProvider({ children }) {
         // ignore
       }
     }
-  }, [chatSessions, setChatSessions, setChatSessionId]);
+  }, [chatSessions, setChatSessions, setChatSessionId, authedUsername]);
 
   const sendChatMessage = useCallback(
     async (queryText = chatQuery) => {
@@ -1587,3 +1655,5 @@ export function useAdmin() {
     isStalenessChecking, setIsStalenessChecking,
   };
 }
+
+export { getUserChatSessionsKey, getUserActiveSessionIdKey, loadUserChatSessions };

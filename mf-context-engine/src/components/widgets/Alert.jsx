@@ -13,11 +13,14 @@ const ICONS = {
   ),
 };
 
-export default function Alert({ type = "info", children }) {
+export default function Alert({ type = "info", title, message, children }) {
   return (
     <div className={`stAlert stAlert--${type}`}>
       {ICONS[type]}
-      <div className="stAlert-body">{children}</div>
+      <div className="stAlert-body">
+        {title && <div style={{ fontWeight: 600, marginBottom: children || message ? 4 : 0 }}>{title}</div>}
+        {children || message}
+      </div>
     </div>
   );
 }

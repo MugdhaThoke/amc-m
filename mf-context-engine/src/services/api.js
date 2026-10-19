@@ -322,13 +322,36 @@ export function adaptHybridResponse(hybridData, latencyMs = 0) {
   }));
 
   const gh = hybridData.graph_highlight || {};
-  const rawNodes = gh.node_names || hybridData.graph_nodes || [];
-  const rawEdges = gh.edges || hybridData.graph_edges || [];
-  const rawEdgesUsed = gh.edges_used_in_prompt || hybridData.graph_edges_used_in_prompt || rawEdges;
-  const matchedEntities = gh.entities || hybridData.matched_entity_texts || [];
-  const activeLabels = gh.labels || hybridData.active_labels || [];
-  const entitySummary = gh.entity_summary || hybridData.entity_summary || [];
+  let rawNodes = Array.isArray(gh.node_names) && gh.node_names.length > 0
+    ? gh.node_names
+    : (Array.isArray(hybridData.graph_nodes) && hybridData.graph_nodes.length > 0 ? hybridData.graph_nodes : []);
+  let rawEdges = Array.isArray(gh.edges) && gh.edges.length > 0
+    ? gh.edges
+    : (Array.isArray(hybridData.graph_edges) && hybridData.graph_edges.length > 0 ? hybridData.graph_edges : []);
+  let rawEdgesUsed = gh.edges_used_in_prompt || hybridData.graph_edges_used_in_prompt || rawEdges;
+  let matchedEntities = gh.entities || hybridData.matched_entity_texts || [];
+  let activeLabels = gh.labels || hybridData.active_labels || [];
+  let entitySummary = gh.entity_summary || hybridData.entity_summary || [];
   const tb = gh.telemetry_breakdown || hybridData.telemetry_breakdown || {};
+
+  // Mutual fallback derivations to guarantee graph visualization integrity
+  if (rawNodes.length === 0 && rawEdges.length > 0) {
+    rawNodes = Array.from(new Set(rawEdges.flatMap((e) => [e.s, e.o]).filter(Boolean)));
+  }
+  if ((!tb.triplet_table || tb.triplet_table.length === 0) && rawEdges.length > 0) {
+    tb.triplet_table = rawEdges.map((e) => ({
+      s: e.s,
+      rel: e.rel || "CONNECTED_TO",
+      o: e.o,
+      conf: e.conf ?? 1.0,
+    }));
+  }
+  if ((!entitySummary || entitySummary.length === 0) && rawNodes.length > 0) {
+    entitySummary = [{ label: "Entity", count: rawNodes.length, active: true }];
+  }
+  if ((!matchedEntities || matchedEntities.length === 0) && rawNodes.length > 0) {
+    matchedEntities = rawNodes.slice(0, 2);
+  }
 
   const totalTokens =
     gh.total_tokens ||
@@ -929,6 +952,17 @@ export async function batchApproveCorrections(patchIds, action, comment = "") {
   return await request("/governance/batch-approve", {
     method: "POST",
     body: JSON.stringify({ patch_ids: patchIds, action, comment }),
+  });
+}
+
+export async function runGovernanceBatch(autoApproveThreshold = 0.95, maxRiskLevel = "LOW", dryRun = false) {
+  return await request("/governance/run-batch", {
+    method: "POST",
+    body: JSON.stringify({
+      auto_approve_threshold: autoApproveThreshold,
+      max_risk_level: maxRiskLevel,
+      dry_run: dryRun,
+    }),
   });
 }
 

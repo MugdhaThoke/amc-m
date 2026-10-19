@@ -13,6 +13,7 @@ import {
   Layers,
   ArrowRight,
   Info,
+  Zap,
 } from "lucide-react";
 import Button from "../../components/widgets/Button";
 import TextInput from "../../components/widgets/TextInput";
@@ -23,6 +24,7 @@ import {
   approveCorrection,
   rejectCorrection,
   batchApproveCorrections,
+  runGovernanceBatch,
 } from "../../services/api";
 
 export default function GovernancePage() {
@@ -30,6 +32,7 @@ export default function GovernancePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [successMsg, setSuccessMsg] = useState(null);
+  const [autoBatchLoading, setAutoBatchLoading] = useState(false);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [riskFilter, setRiskFilter] = useState("All");
@@ -158,7 +161,30 @@ export default function GovernancePage() {
     }
   };
 
+  const handleRunAutoApproveBatch = async () => {
+    console.log("FRONTEND: handleRunAutoApproveBatch clicked");
+    setAutoBatchLoading(true);
+    setError(null);
+    setSuccessMsg(null);
+    try {
+      console.log("FRONTEND: Calling runGovernanceBatch(0.95, 'LOW', false)...");
+      const res = await runGovernanceBatch(0.95, "LOW", false);
+      console.log("FRONTEND: runGovernanceBatch response:", res);
+      const approvedCount = res.approved ?? 0;
+      setSuccessMsg(
+        `Hands-Free Auto-Approval Batch completed: ${approvedCount} high-confidence (>=95%) low-risk patch(es) promoted directly into Canonical Knowledge Graph.`
+      );
+      await loadData();
+    } catch (err) {
+      console.error("FRONTEND: runGovernanceBatch error:", err);
+      setError(`Auto-approval batch failed: ${err.message}`);
+    } finally {
+      setAutoBatchLoading(false);
+    }
+  };
+
   const highRiskCount = corrections.filter((c) => c.risk_level === "HIGH").length;
+  const autoEligibleCount = corrections.filter((c) => c.confidence >= 0.95 && c.risk_level === "LOW").length;
 
   return (
     <div style={{ padding: "8px 0" }}>
@@ -174,15 +200,28 @@ export default function GovernancePage() {
             promoting them to the permanent canonical Neo4j knowledge graph.
           </div>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={loadData}
-          disabled={loading || actionInProgress}
-          icon={RefreshCw}
-        >
-          {loading ? "Refreshing..." : "Refresh Queue"}
-        </Button>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={handleRunAutoApproveBatch}
+            disabled={loading || actionInProgress || autoBatchLoading}
+            icon={Zap}
+            style={{ background: "#059669", borderColor: "#059669" }}
+            title="Automatically promote all pending patches with confidence >= 95% and LOW risk to canonical Neo4j graph"
+          >
+            {autoBatchLoading ? "Running Auto-Batch..." : `Run Auto-Approve Batch (${autoEligibleCount})`}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={loadData}
+            disabled={loading || actionInProgress || autoBatchLoading}
+            icon={RefreshCw}
+          >
+            {loading ? "Refreshing..." : "Refresh Queue"}
+          </Button>
+        </div>
       </div>
 
       {/* Summary KPI Cards */}
@@ -191,7 +230,7 @@ export default function GovernancePage() {
           display: "grid",
           gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
           gap: 12,
-          marginBottom: 20,
+          marginBottom: 16,
         }}
       >
         <div className="card" style={{ padding: 14, display: "flex", alignItems: "center", gap: 12 }}>
@@ -201,6 +240,18 @@ export default function GovernancePage() {
           <div>
             <div style={{ fontSize: 12, color: "#64748b" }}>Pending Corrections</div>
             <div style={{ fontSize: 22, fontWeight: 700 }}>{corrections.length}</div>
+          </div>
+        </div>
+
+        <div className="card" style={{ padding: 14, display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ padding: 10, borderRadius: 8, background: "rgba(16, 185, 129, 0.15)", color: "#059669" }}>
+            <Zap size={22} />
+          </div>
+          <div>
+            <div style={{ fontSize: 12, color: "#64748b" }}>Auto-Approve Eligible</div>
+            <div style={{ fontSize: 22, fontWeight: 700, color: autoEligibleCount > 0 ? "#059669" : "inherit" }}>
+              {autoEligibleCount}
+            </div>
           </div>
         </div>
 
@@ -217,7 +268,7 @@ export default function GovernancePage() {
         </div>
 
         <div className="card" style={{ padding: 14, display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{ padding: 10, borderRadius: 8, background: "rgba(16, 185, 129, 0.1)", color: "#059669" }}>
+          <div style={{ padding: 10, borderRadius: 8, background: "rgba(100, 116, 139, 0.1)", color: "#475569" }}>
             <ShieldCheck size={22} />
           </div>
           <div>
@@ -225,6 +276,31 @@ export default function GovernancePage() {
             <div style={{ fontSize: 22, fontWeight: 700 }}>7 Days TTL</div>
           </div>
         </div>
+      </div>
+
+      {/* Auto-Approval Policy Bar */}
+      <div
+        style={{
+          background: "linear-gradient(90deg, rgba(5, 150, 105, 0.08) 0%, rgba(37, 99, 235, 0.08) 100%)",
+          border: "1px solid rgba(5, 150, 105, 0.2)",
+          borderRadius: 8,
+          padding: "10px 14px",
+          marginBottom: 16,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          fontSize: 13,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <Zap size={16} color="#059669" />
+          <span>
+            <strong>100% Hands-Free Auto-Approval:</strong> Patches with confidence &ge; 95% and LOW risk are automatically promoted to the canonical Neo4j graph without requiring manual compliance clicks.
+          </span>
+        </div>
+        <span style={{ fontSize: 11, fontWeight: 600, color: "#059669", background: "white", padding: "2px 8px", borderRadius: 4, border: "1px solid rgba(5, 150, 105, 0.3)", whiteSpace: "nowrap" }}>
+          Policy: &ge; 95% Conf / LOW Risk
+        </span>
       </div>
 
       {error && (
@@ -376,19 +452,40 @@ export default function GovernancePage() {
                         </div>
                       </td>
                       <td style={{ padding: "12px 14px" }}>
-                        <span
-                          style={{
-                            display: "inline-block",
-                            padding: "2px 8px",
-                            borderRadius: 12,
-                            fontSize: 11,
-                            fontWeight: 600,
-                            background: confPct >= 85 ? "rgba(16, 185, 129, 0.12)" : "rgba(245, 158, 11, 0.12)",
-                            color: confPct >= 85 ? "#059669" : "#d97706",
-                          }}
-                        >
-                          {confPct}%
-                        </span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span
+                            style={{
+                              display: "inline-block",
+                              padding: "2px 8px",
+                              borderRadius: 12,
+                              fontSize: 11,
+                              fontWeight: 600,
+                              background: confPct >= 85 ? "rgba(16, 185, 129, 0.12)" : "rgba(245, 158, 11, 0.12)",
+                              color: confPct >= 85 ? "#059669" : "#d97706",
+                            }}
+                          >
+                            {confPct}%
+                          </span>
+                          {confPct >= 95 && c.risk_level === "LOW" && (
+                            <span
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: 2,
+                                padding: "1px 6px",
+                                borderRadius: 4,
+                                fontSize: 10,
+                                fontWeight: 700,
+                                background: "#ecfdf5",
+                                color: "#059669",
+                                border: "1px solid rgba(16, 185, 129, 0.3)",
+                              }}
+                              title="Eligible for 100% hands-free automatic approval (>= 95% confidence, LOW risk)"
+                            >
+                              <Zap size={10} /> AUTO
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td style={{ padding: "12px 14px" }}>
                         <span
