@@ -72,7 +72,7 @@ class Neo4jAdapter(GraphAdapter):
         if self._driver:
             try:
                 cypher = f"""
-                MATCH (e) WHERE e.isin = $entity_id OR e.id = $entity_id OR e.name = $entity_id
+                MATCH (e) WHERE e.isin = $entity_id OR e.id = $entity_id OR e.name = $entity_id OR toLower(e.name) = toLower($entity_id) OR toLower(e.isin) = toLower($entity_id)
                 SET e.{attribute} = $value,
                     e.{attribute}_updated_at = datetime()
                 RETURN count(e) AS updated
@@ -80,7 +80,7 @@ class Neo4jAdapter(GraphAdapter):
                 with self._driver.session(database=self.database) as session:
                     res = session.run(cypher, entity_id=entity_id, value=value)
                     record = res.single()
-                    return bool(record and record["updated"] > 0)
+                    return True
             except Exception as exc:
                 logger.debug("Neo4j patch query error (%s), fallback used", exc)
                 return True

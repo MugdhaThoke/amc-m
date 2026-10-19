@@ -27,6 +27,7 @@ from feedback_loop.domain_models import (
     FeedbackRecord,
     LifecycleStatus,
     UnifiedEvaluationRecord,
+    FeedbackSource
 )
 from feedback_loop.services.adjudication import AdjudicationService
 from feedback_loop.services.classification import ClassificationService
@@ -244,7 +245,7 @@ class RecordBuilder:
                     "correction_claims": row.corrections if isinstance(row.corrections, list) else ([row.corrections] if row.corrections else []),
                     "feedback_text": row.notes,
                 }
-                if (enrichment.dissatisfaction_signal or row.corrections)
+                if (enrichment.dissatisfaction_signal or row.corrections or row.notes or row.source in (FeedbackSource.ACTIVE, "active"))
                 else None
             ),
             repair=repair_analysis.repair,

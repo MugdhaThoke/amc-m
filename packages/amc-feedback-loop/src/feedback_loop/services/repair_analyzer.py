@@ -69,6 +69,8 @@ class RepairAnalyzerService:
             target_map = {
                 StackLayer.KNOWLEDGE: RepairTarget.GRAPH,
                 StackLayer.GRAPH: RepairTarget.GRAPH,
+                StackLayer.COMPLIANCE: RepairTarget.GRAPH,
+                StackLayer.CONTEXT_ENGINEERING: RepairTarget.VECTOR,
                 StackLayer.RETRIEVAL: RepairTarget.VECTOR,
                 StackLayer.MODEL: RepairTarget.VECTOR,
             }
